@@ -4,8 +4,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { mkdir, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, extname, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 
 type Role = "user" | "assistant";
 
@@ -38,45 +37,23 @@ function textContent(content: unknown): string {
     .trim();
 }
 
-function parseArgs(args: string | undefined): {
-  filepath?: string;
-  messageCount: number;
-} {
-  const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
-  let filepath: string | undefined;
-  let messageCount = 1;
+function parseMessageCount(args: string | undefined): number {
+  const value = (args ?? "").trim();
 
-  for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i];
-
-    if (token === "-n" || token === "--messages") {
-      const value = tokens[++i];
-      const parsed = Number.parseInt(value ?? "", 10);
-      if (!Number.isInteger(parsed) || parsed < 1) {
-        throw new Error("--messages must be a positive integer.");
-      }
-      messageCount = parsed;
-      continue;
-    }
-
-    if (token.startsWith("--messages=")) {
-      const parsed = Number.parseInt(token.slice("--messages=".length), 10);
-      if (!Number.isInteger(parsed) || parsed < 1) {
-        throw new Error("--messages must be a positive integer.");
-      }
-      messageCount = parsed;
-      continue;
-    }
-
-    if (!filepath) {
-      filepath = token;
-      continue;
-    }
-
-    throw new Error(`Unexpected argument: ${token}`);
+  if (!value) {
+    return 1;
   }
 
-  return { filepath, messageCount };
+  if (!/^\d+$/.test(value)) {
+    throw new Error("Message count must be a positive integer.");
+  }
+
+  const count = Number.parseInt(value, 10);
+  if (count < 1) {
+    throw new Error("Message count must be a positive integer.");
+  }
+
+  return count;
 }
 
 function localTimestamp(date = new Date()): string {
@@ -111,14 +88,8 @@ function filenameSafeTitle(text: string, maxLength = 48): string {
   return cleaned || "response";
 }
 
-function withTimestamp(filepath: string, timestamp: string): string {
-  const extension = extname(filepath);
-
-  if (!extension) {
-    return `${filepath}-${timestamp}.md`;
-  }
-
-  return `${filepath.slice(0, -extension.length)}-${timestamp}${extension}`;
+function generateFilename(text: string, timestamp: string): string {
+  return `${filenameSafeTitle(text)}-${timestamp}.md`;
 }
 
 function formatMarkdown(messages: SavedMessage[]): string {
@@ -142,7 +113,7 @@ export default function tailExtension(pi: ExtensionAPI) {
       try {
         await ctx.waitForIdle();
 
-        const { filepath: requestedPath, messageCount } = parseArgs(args);
+        const messageCount = parseMessageCount(args);
         const branch = ctx.sessionManager.getBranch();
 
         const messages: SavedMessage[] = branch
@@ -170,15 +141,9 @@ export default function tailExtension(pi: ExtensionAPI) {
         const start = Math.max(0, lastAssistantIndex - messageCount + 1);
         const selected = messages.slice(start, lastAssistantIndex + 1);
 
-        const title = filenameSafeTitle(selected[0].text);
-        const timestamp = localTimestamp();
-        let filepath = withTimestamp(requestedPath ?? title, timestamp);
-
-        if (filepath.startsWith("~/") || filepath === "~") {
-          filepath = filepath.replace("~", homedir());
-        }
-
+        const filepath = generateFilename(selected[0].text, localTimestamp());
         const absolutePath = resolve(ctx.cwd, filepath);
+
         await mkdir(dirname(absolutePath), { recursive: true });
         await writeFile(absolutePath, formatMarkdown(selected), {
           encoding: "utf8",
