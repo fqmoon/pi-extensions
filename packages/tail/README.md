@@ -8,19 +8,17 @@ Based on Joey Gibson's [`save` extension](https://github.com/joeygibson/pi-exten
 
 ```text
 /tail
-/tail notes
-/tail -n 2
-/tail notes -n 4
-/tail --messages 4
+/tail 2
+/tail 4
 ```
 
-`-n` / `--messages` controls how many recent user/assistant messages are preserved, ending at the latest assistant response. The default is `1`.
+The optional positional argument controls how many recent user/assistant messages are preserved, ending at the latest assistant response. The default is `1`.
 
 Examples:
 
-- `-n 1`: latest assistant response only
-- `-n 2`: latest user + assistant pair
-- `-n 4`: latest two user + assistant pairs, assuming the conversation alternates normally
+- `/tail`: latest assistant response only
+- `/tail 2`: latest user + assistant pair
+- `/tail 4`: latest two user + assistant pairs, assuming the conversation alternates normally
 
 The generated filename uses the first non-empty line of the first saved message, sanitized and truncated, followed by a local-time timestamp accurate to the minute:
 
@@ -28,7 +26,7 @@ The generated filename uses the first non-empty line of the first saved message,
 <title>-YYYYMMDD-HHmm.md
 ```
 
-If a filepath is supplied, the timestamp is inserted before its extension. Parent directories are created automatically. Existing files are not overwritten.
+Existing files are not overwritten.
 
 When only one assistant message is saved, its Markdown is written unchanged. When multiple messages are saved, each message is prefixed with `## User` or `## Assistant`.
 
