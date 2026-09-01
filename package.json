@@ -9,7 +9,7 @@
   ],
   "pi": {
     "extensions": [
-      "./packages/tail/index.ts"
+      "./packages/pi-tail/index.ts"
     ]
   }
 }

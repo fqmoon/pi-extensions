@@ -36,7 +36,7 @@ When only one assistant message is saved, its Markdown is written unchanged. Whe
 pi install npm:@fqmoon/pi-tail
 ```
 
-During development, install the repository or load `packages/tail/index.ts` directly from Pi.
+During development, install the repository or load `packages/pi-tail/index.ts` directly from Pi.
 
 ## License
 

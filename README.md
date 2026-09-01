@@ -8,7 +8,7 @@ Some extensions for pi-agent.
 
 Save the tail of the current conversation as Markdown, ending at the latest assistant response.
 
-Location: [`packages/tail`](./packages/tail)
+Location: [`packages/pi-tail`](./packages/pi-tail)
 
 ```text
 /tail

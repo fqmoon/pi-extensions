@@ -17,14 +17,14 @@
   ],
   "author": "fqmoon",
   "license": "MIT",
-  "homepage": "https://github.com/fqmoon/pi-extensions/tree/main/packages/tail#readme",
+  "homepage": "https://github.com/fqmoon/pi-extensions/tree/main/packages/pi-tail#readme",
   "bugs": {
     "url": "https://github.com/fqmoon/pi-extensions/issues"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/fqmoon/pi-extensions.git",
-    "directory": "packages/tail"
+    "directory": "packages/pi-tail"
   },
   "publishConfig": {
     "access": "public"
