@@ -1,5 +1,7 @@
 # pi-chat-tail
 
+English | [简体中文](README.zh-CN.md)
+
 A Pi extension that saves the tail of the current conversation as Markdown, ending at the latest assistant response.
 
 Based on Joey Gibson's [`save` extension](https://github.com/joeygibson/pi-extensions/blob/main/extensions/save.ts) and modified under the MIT License.
