@@ -3,5 +3,13 @@
   "private": true,
   "workspaces": [
     "packages/*"
-  ]
+  ],
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./packages/save-md/index.ts"
+    ]
+  }
 }
