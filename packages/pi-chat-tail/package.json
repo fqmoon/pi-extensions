@@ -1,5 +1,5 @@
 {
-  "name": "@fqmoon/pi-chat-tail",
+  "name": "pi-chat-tail",
   "version": "0.1.0",
   "description": "Pi extension for saving the tail of the current conversation as Markdown.",
   "type": "module",
