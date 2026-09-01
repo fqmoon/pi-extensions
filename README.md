@@ -12,8 +12,10 @@ Location: [`packages/tail`](./packages/tail)
 
 ```text
 /tail
-/tail -n 2
-/tail notes -n 4
+/tail 2
+/tail 4
 ```
+
+The optional positional argument is the number of recent user/assistant messages to save. It defaults to `1`.
 
 Each extension is kept as an independent package so it can be published to npm separately while remaining in this monorepo.
