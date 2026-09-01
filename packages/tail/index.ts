@@ -92,6 +92,36 @@ function generateFilename(text: string, timestamp: string): string {
   return `${filenameSafeTitle(text)}-${timestamp}.md`;
 }
 
+async function writeUniqueFile(
+  directory: string,
+  filename: string,
+  content: string,
+): Promise<string> {
+  const stem = filename.slice(0, -".md".length);
+
+  for (let suffix = 1; ; suffix += 1) {
+    const candidate = suffix === 1 ? filename : `${stem}-${suffix}.md`;
+
+    try {
+      await writeFile(resolve(directory, candidate), content, {
+        encoding: "utf8",
+        flag: "wx",
+      });
+      return candidate;
+    } catch (error) {
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        error.code === "EEXIST"
+      ) {
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
 function formatMarkdown(messages: SavedMessage[]): string {
   if (messages.length === 1 && messages[0].role === "assistant") {
     return `${messages[0].text}\n`;
@@ -141,14 +171,15 @@ export default function tailExtension(pi: ExtensionAPI) {
         const start = Math.max(0, lastAssistantIndex - messageCount + 1);
         const selected = messages.slice(start, lastAssistantIndex + 1);
 
-        const filepath = generateFilename(selected[0].text, localTimestamp());
-        const absolutePath = resolve(ctx.cwd, filepath);
+        const filename = generateFilename(selected[0].text, localTimestamp());
+        const absolutePath = resolve(ctx.cwd, filename);
 
         await mkdir(dirname(absolutePath), { recursive: true });
-        await writeFile(absolutePath, formatMarkdown(selected), {
-          encoding: "utf8",
-          flag: "wx",
-        });
+        const filepath = await writeUniqueFile(
+          ctx.cwd,
+          filename,
+          formatMarkdown(selected),
+        );
 
         ctx.ui.notify(`Saved to ${filepath}`, "info");
       } catch (error) {

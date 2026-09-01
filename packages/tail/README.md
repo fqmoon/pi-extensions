@@ -26,7 +26,7 @@ The generated filename uses the first non-empty line of the first saved message,
 <title>-YYYYMMDD-HHmm.md
 ```
 
-Existing files are not overwritten.
+Existing files are not overwritten. If the generated filename already exists, a numeric suffix is added: `title-YYYYMMDD-HHmm.md`, then `title-YYYYMMDD-HHmm-2.md`, `title-YYYYMMDD-HHmm-3.md`, and so on.
 
 When only one assistant message is saved, its Markdown is written unchanged. When multiple messages are saved, each message is prefixed with `## User` or `## Assistant`.
 
