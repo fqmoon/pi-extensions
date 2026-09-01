@@ -1,0 +1,26 @@
+{
+  "name": "@fqmoon/pi-save-md",
+  "version": "0.1.0",
+  "description": "Pi extension for saving recent conversation messages as Markdown.",
+  "type": "module",
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi",
+    "pi-agent",
+    "pi-extension",
+    "markdown"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fqmoon/pi-extensions.git",
+    "directory": "packages/save-md"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
