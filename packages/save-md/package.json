@@ -12,7 +12,8 @@
     "pi",
     "pi-agent",
     "pi-extension",
-    "markdown"
+    "markdown",
+    "pi-package"
   ],
   "license": "MIT",
   "repository": {
@@ -21,6 +22,11 @@
     "directory": "packages/save-md"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
   }
 }
