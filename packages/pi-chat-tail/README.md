@@ -2,9 +2,27 @@
 
 English | [简体中文](README.zh-CN.md)
 
-A Pi extension that saves the tail of the current conversation as Markdown, ending at the latest assistant response.
+## Why ask an LLM to write another handoff Markdown every time you end a session?
 
-Based on Joey Gibson's [`save` extension](https://github.com/joeygibson/pi-extensions/blob/main/extensions/save.ts) and modified under the MIT License.
+Many Agent workflows end like this:
+
+> “Summarize our discussion as Markdown so I can continue in the next session.”
+
+But the conclusions that matter are often already there in the last few messages.
+
+Asking the LLM to summarize them again means another round of waiting and another round of tokens. It may also reinterpret details that were already accurate.
+
+`pi-chat-tail` does one simple thing:
+
+It saves the last few messages of the current conversation directly as Markdown.
+
+**No model call. No summarization. No rewriting.**
+
+```text
+/tail
+```
+
+Then you can end the session.
 
 ## Usage
 
@@ -14,23 +32,31 @@ Based on Joey Gibson's [`save` extension](https://github.com/joeygibson/pi-exten
 /tail 4
 ```
 
-The optional positional argument controls how many recent user/assistant messages are preserved, ending at the latest assistant response. The default is `1`.
+The number tells `pi-chat-tail` how many recent User / Assistant messages to save. The default is `1`.
 
-Examples:
+For example:
 
-- `/tail`: latest assistant response only
-- `/tail 2`: latest user + assistant pair
-- `/tail 4`: latest two user + assistant pairs, assuming the conversation alternates normally
+- `/tail`: save the latest Assistant response
+- `/tail 2`: save the latest User + Assistant pair
+- `/tail 4`: save the latest two User + Assistant pairs
 
-The generated filename uses the first non-empty line of the first saved message, sanitized and truncated, followed by a local-time timestamp accurate to the minute:
+If you usually ask the Agent for a final plan before ending a session, `/tail` is normally enough.
+
+If the last few turns are themselves useful context, use `/tail 2` or `/tail 4`.
+
+## Output
+
+`/tail` creates a Markdown file in the current directory.
+
+Its filename is based on the first saved message, with the date and time appended. For example:
 
 ```text
-<title>-YYYYMMDD-HHmm.md
+SDK-TypeScript-migration-plan-20260901-2214.md
 ```
 
-Existing files are not overwritten. If the generated filename already exists, a numeric suffix is added: `title-YYYYMMDD-HHmm.md`, then `title-YYYYMMDD-HHmm-2.md`, `title-YYYYMMDD-HHmm-3.md`, and so on.
+When saving a single Assistant message, its original Markdown is preserved.
 
-When only one assistant message is saved, its Markdown is written unchanged. When multiple messages are saved, each message is prefixed with `## User` or `## Assistant`.
+When saving multiple messages, `## User` and `## Assistant` headings identify each role.
 
 ## Install
 
@@ -38,8 +64,56 @@ When only one assistant message is saved, its Markdown is written unchanged. Whe
 pi install npm:pi-chat-tail
 ```
 
-During development, install the repository or load `packages/pi-chat-tail/index.ts` directly from Pi.
+Once installed, simply run:
+
+```text
+/tail
+```
+
+For development, you can also load this file directly from the repository:
+
+```text
+packages/pi-chat-tail/index.ts
+```
+
+## Why not ask the Agent to summarize?
+
+You can.
+
+But if your workflow looks like this:
+
+```text
+Discuss
+↓
+Reach a conclusion
+↓
+Agent writes the final plan
+↓
+Agent summarizes that final plan again
+↓
+Save the Markdown
+```
+
+The last two steps are really the same job twice.
+
+`pi-chat-tail` turns that into:
+
+```text
+Discuss
+↓
+Reach a conclusion
+↓
+Agent writes the final plan
+↓
+/tail
+```
+
+Tools should shorten workflows, not add another workflow on top.
 
 ## License
 
-MIT. This package contains code derived from Joey Gibson's MIT-licensed `save` extension; the package license preserves both copyright notices.
+MIT.
+
+This project contains code adapted from Joey Gibson’s [`save` extension](https://github.com/joeygibson/pi-extensions/blob/main/extensions/save.ts), which is also licensed under the MIT License.
+
+The corresponding copyright notice is preserved in the license file.
