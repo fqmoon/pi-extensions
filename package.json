@@ -9,7 +9,7 @@
   ],
   "pi": {
     "extensions": [
-      "./packages/save-md/index.ts"
+      "./packages/tail/index.ts"
     ]
   }
 }
