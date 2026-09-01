@@ -4,16 +4,16 @@ Some extensions for pi-agent.
 
 ## Extensions
 
-### save-md
+### tail
 
-Save the latest assistant response, optionally with recent user/assistant messages, as Markdown.
+Save the tail of the current conversation as Markdown, ending at the latest assistant response.
 
-Location: [`packages/save-md`](./packages/save-md)
+Location: [`packages/tail`](./packages/tail)
 
 ```text
-/save
-/save -n 2
-/save notes -n 4
+/tail
+/tail -n 2
+/tail notes -n 4
 ```
 
 Each extension is kept as an independent package so it can be published to npm separately while remaining in this monorepo.
