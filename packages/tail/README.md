@@ -32,8 +32,6 @@ When only one assistant message is saved, its Markdown is written unchanged. Whe
 
 ## Install
 
-From npm after publication:
-
 ```bash
 pi install npm:@fqmoon/pi-tail
 ```

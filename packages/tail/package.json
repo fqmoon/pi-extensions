@@ -15,11 +15,19 @@
     "markdown",
     "pi-package"
   ],
+  "author": "fqmoon",
   "license": "MIT",
+  "homepage": "https://github.com/fqmoon/pi-extensions/tree/main/packages/tail#readme",
+  "bugs": {
+    "url": "https://github.com/fqmoon/pi-extensions/issues"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/fqmoon/pi-extensions.git",
     "directory": "packages/tail"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
