@@ -79,7 +79,7 @@ function filenameSafeTitle(text: string, maxLength = 48): string {
     .replace(/^#{1,6}\s+/, "")
     .replace(/^>\s*/, "")
     .replace(/^[-*+]\s+/, "")
-    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "")
+    .replace(/[^\p{L}\p{N}\p{M}\s._-]+/gu, " ")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, maxLength)
