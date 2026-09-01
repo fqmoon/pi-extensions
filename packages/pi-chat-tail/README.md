@@ -1,4 +1,4 @@
-# @fqmoon/pi-tail
+# @fqmoon/pi-chat-tail
 
 A Pi extension that saves the tail of the current conversation as Markdown, ending at the latest assistant response.
 
@@ -33,10 +33,10 @@ When only one assistant message is saved, its Markdown is written unchanged. Whe
 ## Install
 
 ```bash
-pi install npm:@fqmoon/pi-tail
+pi install npm:@fqmoon/pi-chat-tail
 ```
 
-During development, install the repository or load `packages/pi-tail/index.ts` directly from Pi.
+During development, install the repository or load `packages/pi-chat-tail/index.ts` directly from Pi.
 
 ## License
 

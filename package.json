@@ -9,7 +9,7 @@
   ],
   "pi": {
     "extensions": [
-      "./packages/pi-tail/index.ts"
+      "./packages/pi-chat-tail/index.ts"
     ]
   }
 }
