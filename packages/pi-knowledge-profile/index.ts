@@ -16,6 +16,7 @@ const MAX_SESSION_CHARS = 24_000;
 const MAX_MESSAGE_CHARS = 6_000;
 const MAX_CANDIDATES_SAFETY = 200;
 const DEFAULT_REMINDER_THRESHOLD = 5;
+const DEFAULT_BATCH_SIZE = 20;
 const STATUSES = ["完全掌握", "重要部分掌握", "基本不懂", "完全不懂"] as const;
 const EVIDENCE_SIGNALS = ["positive", "negative"] as const;
 const EVIDENCE_STRENGTHS = ["strong", "moderate"] as const;
@@ -26,8 +27,9 @@ type EvidenceStrength = (typeof EVIDENCE_STRENGTHS)[number];
 type Checkpoint = Record<string, string>;
 type StagedSession = { lastEntryId: string; evidence: Evidence[] };
 type State = {
-  version: 2;
+  version: 3;
   reminderThreshold: number;
+  batchSize: number;
   checkpoints: Checkpoint;
   staged: Record<string, StagedSession>;
 };
@@ -68,9 +70,20 @@ type ProfileChange = {
   previousStatus?: Status;
   status: Status;
 };
+type BatchCommitResult = {
+  committed: number;
+  failures: number;
+  changes: ProfileChange[];
+};
 
 function defaultState(): State {
-  return { version: 2, reminderThreshold: DEFAULT_REMINDER_THRESHOLD, checkpoints: {}, staged: {} };
+  return {
+    version: 3,
+    reminderThreshold: DEFAULT_REMINDER_THRESHOLD,
+    batchSize: DEFAULT_BATCH_SIZE,
+    checkpoints: {},
+    staged: {},
+  };
 }
 
 function emptyProfile(): Profile {
@@ -118,9 +131,13 @@ async function loadState(): Promise<State> {
     const reminderThreshold = Number.isInteger(parsed.reminderThreshold) && (parsed.reminderThreshold ?? 0) > 0
       ? parsed.reminderThreshold as number
       : DEFAULT_REMINDER_THRESHOLD;
+    const batchSize = Number.isInteger(parsed.batchSize) && (parsed.batchSize ?? 0) > 0
+      ? parsed.batchSize as number
+      : DEFAULT_BATCH_SIZE;
     return {
-      version: 2,
+      version: 3,
       reminderThreshold,
+      batchSize,
       checkpoints: parsed.checkpoints && typeof parsed.checkpoints === "object" ? parsed.checkpoints : {},
       staged: parsed.staged && typeof parsed.staged === "object"
         ? Object.fromEntries(Object.entries(parsed.staged).flatMap(([path, item]) => {
@@ -311,11 +328,18 @@ const EXTRACTION_SYSTEM = `You extract evidence about both what a user understan
 
 const RECONCILIATION_SYSTEM = `You reconcile cross-session evidence into an automatically maintained user knowledge profile. Return only a JSON array, with objects exactly {"domain":"...","subdomain":"...","knowledgePoint":"...","suggestedStatus":"完全掌握|重要部分掌握|基本不懂|完全不懂","context":"...","evidence":["concrete evidence"],"reason":"why this status, including why neighbouring statuses are less appropriate"}. The profile is bidirectional: it records both what may be assumed and what should be explained. Unknown or never-discussed knowledge must remain absent, not be classified as ignorance. Use positive and negative evidence together, including repeated moderate evidence across sessions. 完全掌握 means the user demonstrates reliable command including relevant boundaries or application. 重要部分掌握 means the core is usable but some limits remain. 基本不懂 means there is concrete evidence of material gaps, misconceptions, or unstable understanding, while some familiarity may exist. 完全不懂 requires strong explicit evidence of essentially no foundation in that specific knowledge point; never infer it merely from a question, one mistake, or missing evidence. Existing points may move in either direction only when new evidence justifies the change. Keep knowledge points narrow enough that the evidence genuinely supports the status. Include only points for which the evidence justifies an add or update.`;
 
-async function extractEvidence(ctx: ExtensionCommandContext, state: State, transcripts: Transcript[]): Promise<ExtractionResult> {
+async function extractEvidence(
+  ctx: ExtensionCommandContext,
+  state: State,
+  transcripts: Transcript[],
+  offset: number,
+  total: number,
+): Promise<ExtractionResult> {
   const completed: Transcript[] = [];
   const failures: AnalysisFailure[] = [];
   for (const [index, transcript] of transcripts.entries()) {
-    const label = `Knowledge Profile: extracting evidence ${index + 1}/${transcripts.length}`;
+    const position = offset + index + 1;
+    const label = `Knowledge Profile: extracting evidence ${position}/${total}`;
     ctx.ui.setWorkingMessage(label);
     ctx.ui.setStatus("knowledge-profile", label);
     try {
@@ -325,18 +349,22 @@ async function extractEvidence(ctx: ExtensionCommandContext, state: State, trans
         const raw = item as Record<string, unknown>;
         const evidence = cleanEvidence(raw.evidence);
         if (typeof raw.context !== "string" || !validEvidenceSignal(raw.signal) || !validEvidenceStrength(raw.strength) || evidence.length === 0) return [];
-        return [{
+        const result: Evidence = {
           session: basename(transcript.path),
           context: raw.context.trim(),
           signal: raw.signal,
           strength: raw.strength,
           evidence,
-          caution: typeof raw.caution === "string" ? raw.caution.trim() : undefined,
-        }];
+        };
+        if (typeof raw.caution === "string" && raw.caution.trim()) result.caution = raw.caution.trim();
+        return result.context ? [result] : [];
       });
       completed.push(transcript);
       const staged = state.staged[transcript.path];
-      state.staged[transcript.path] = { lastEntryId: transcript.lastEntryId, evidence: [...(staged?.evidence ?? []), ...items] };
+      state.staged[transcript.path] = {
+        lastEntryId: transcript.lastEntryId,
+        evidence: [...(staged?.evidence ?? []), ...items],
+      };
       await writeState(state);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
@@ -383,10 +411,10 @@ function upsertCandidate(profile: Profile, candidate: Candidate): ProfileChange 
   return { kind: "updated", path, previousStatus, status: point.status };
 }
 
-function formatChanges(changes: ProfileChange[], committed: number, failures: number): string {
+function formatChanges(changes: ProfileChange[], committed: number, failures: number, batchLabel?: string): string {
   const added = changes.filter((item) => item.kind === "added");
   const updated = changes.filter((item) => item.kind === "updated");
-  const lines = ["Knowledge Profile updated", ""];
+  const lines = [batchLabel ? `Knowledge Profile: ${batchLabel}` : "Knowledge Profile updated", ""];
   if (added.length > 0) lines.push(`新增 ${added.length}`, ...added.map((item) => `- ${item.path} → ${item.status}`), "");
   if (updated.length > 0) lines.push(`更新 ${updated.length}`, ...updated.map((item) =>
     `- ${item.path}${item.previousStatus === item.status ? ` → ${item.status}` : `: ${item.previousStatus} → ${item.status}`}`), "");
@@ -395,44 +423,92 @@ function formatChanges(changes: ProfileChange[], committed: number, failures: nu
   return lines.join("\n");
 }
 
-async function commitStaged(ctx: ExtensionCommandContext, state: State, failures = 0): Promise<void> {
+async function commitStaged(
+  ctx: ExtensionCommandContext,
+  state: State,
+  failures = 0,
+  batchLabel?: string,
+): Promise<BatchCommitResult> {
   const staged = Object.entries(state.staged);
-  if (staged.length === 0) {
-    ctx.ui.notify("Knowledge Profile: no new conversation history to sync.", "info");
-    return;
-  }
-  const checkpoints = { ...state.checkpoints, ...Object.fromEntries(staged.map(([path, item]) => [path, item.lastEntryId])) };
+  if (staged.length === 0) return { committed: 0, failures, changes: [] };
+
+  const checkpoints = {
+    ...state.checkpoints,
+    ...Object.fromEntries(staged.map(([path, item]) => [path, item.lastEntryId])),
+  };
   const evidence = staged.flatMap(([, item]) => item.evidence);
-  if (evidence.length === 0) {
-    await writeState({ ...state, checkpoints, staged: {} });
-    ctx.ui.notify(`Knowledge Profile: no sufficiently strong evidence found; committed ${staged.length} sessions.`, "info");
-    return;
+  let changes: ProfileChange[] = [];
+
+  if (evidence.length > 0) {
+    ctx.ui.setWorkingMessage(`Knowledge Profile: ${batchLabel ?? "reconciling"}…`);
+    ctx.ui.setStatus("knowledge-profile", `Knowledge Profile: ${batchLabel ?? "reconciling evidence"}`);
+    const profile = await loadProfile();
+    const candidates = await reconcile(ctx, profile, evidence);
+    changes = candidates.map((candidate) => upsertCandidate(profile, candidate));
+    await writeProfile(profile);
+    await renderViews(profile);
   }
-  ctx.ui.setWorkingMessage("Knowledge Profile: reconciling cross-session evidence…");
-  ctx.ui.setStatus("knowledge-profile", "Knowledge Profile: reconciling evidence");
-  const profile = await loadProfile();
-  const candidates = await reconcile(ctx, profile, evidence);
-  const changes = candidates.map((candidate) => upsertCandidate(profile, candidate));
-  await writeProfile(profile);
-  await renderViews(profile);
-  await writeState({ ...state, checkpoints, staged: {} });
-  ctx.ui.notify(formatChanges(changes, staged.length, failures), "info");
+
+  state.checkpoints = checkpoints;
+  state.staged = {};
+  await writeState(state);
+  ctx.ui.notify(formatChanges(changes, staged.length, failures, batchLabel), "info");
+  return { committed: staged.length, failures, changes };
 }
 
 async function sync(ctx: ExtensionCommandContext): Promise<void> {
   const state = await loadState();
   const pending = await collectPending(state);
+  const total = pendingSessionCount(state, pending);
   ctx.ui.setWorkingVisible(true);
-  ctx.ui.setWorkingMessage(`Knowledge Profile: preparing ${pending.length} sessions…`);
-  ctx.ui.setStatus("knowledge-profile", `Knowledge Profile: preparing ${pending.length} sessions`);
+  ctx.ui.setWorkingMessage(`Knowledge Profile: preparing ${total} sessions in batches of ${state.batchSize}…`);
+  ctx.ui.setStatus("knowledge-profile", `Knowledge Profile: preparing ${total} sessions`);
+
   try {
-    let failures = 0;
-    if (pending.length > 0) {
-      const extraction = await extractEvidence(ctx, state, pending);
-      failures = extraction.failures.length;
-      if (failures > 0) ctx.ui.notify(`Knowledge Profile: extracted ${extraction.completed.length}; skipped ${failures}.`, "warning");
+    if (total === 0) {
+      ctx.ui.notify("Knowledge Profile: no new conversation history to sync.", "info");
+      return;
     }
-    await commitStaged(ctx, state, failures);
+
+    let processed = 0;
+    let totalFailures = 0;
+    let totalAdded = 0;
+    let totalUpdated = 0;
+    let batchNumber = 0;
+    let cursor = 0;
+
+    while (Object.keys(state.staged).length > 0 || cursor < pending.length) {
+      batchNumber += 1;
+      const stagedCount = Object.keys(state.staged).length;
+      const room = Math.max(0, state.batchSize - stagedCount);
+      const batch = pending.slice(cursor, cursor + room);
+      cursor += batch.length;
+
+      const projectedBatches = Math.max(batchNumber, batchNumber + Math.ceil((pending.length - cursor) / state.batchSize));
+      const batchLabel = `batch ${batchNumber}/${projectedBatches}`;
+      let failures = 0;
+
+      if (batch.length > 0) {
+        const extraction = await extractEvidence(ctx, state, batch, processed, total);
+        failures = extraction.failures.length;
+        totalFailures += failures;
+        processed += extraction.completed.length + failures;
+        if (failures > 0) {
+          ctx.ui.notify(`Knowledge Profile: ${batchLabel} extracted ${extraction.completed.length}; skipped ${failures}.`, "warning");
+        }
+      }
+
+      const committed = await commitStaged(ctx, state, failures, batchLabel);
+      totalAdded += committed.changes.filter((item) => item.kind === "added").length;
+      totalUpdated += committed.changes.filter((item) => item.kind === "updated").length;
+
+      if (batch.length === 0 && committed.committed === 0) break;
+    }
+
+    ctx.ui.notify(
+      `Knowledge Profile complete\n\nSessions: ${total}\nBatches: ${batchNumber}\nAdded: ${totalAdded}\nUpdated: ${totalUpdated}\nFailed: ${totalFailures}`,
+      "info",
+    );
   } finally {
     ctx.ui.setStatus("knowledge-profile", undefined);
     ctx.ui.setWorkingMessage();
@@ -440,12 +516,15 @@ async function sync(ctx: ExtensionCommandContext): Promise<void> {
   }
 }
 
-function parseThreshold(args: string): number | undefined {
+function parseConfig(args: string): { key?: "threshold" | "batchSize"; value?: number; invalid?: boolean } {
   const normalized = args.trim();
-  if (!normalized) return;
-  const match = normalized.match(/^(?:threshold\s+)?(\d+)$/i);
-  if (!match) return Number.NaN;
-  return Number(match[1]);
+  if (!normalized) return {};
+  const match = normalized.match(/^(threshold|batch-size)\s+(\d+)$/i);
+  if (!match) return { invalid: true };
+  return {
+    key: match[1].toLowerCase() === "threshold" ? "threshold" : "batchSize",
+    value: Number(match[2]),
+  };
 }
 
 export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
@@ -470,12 +549,12 @@ export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
   pi.on("before_agent_start", (event) => {
     if (profile.domains.length === 0) return;
     return {
-      systemPrompt: `${event.systemPrompt}\n\n## User Knowledge Profile\nUse this only to calibrate explanation depth. It is not a task instruction or a statement of current project state. Treat absent knowledge points as unknown, not as understood or not understood. For 完全掌握, you may assume the recorded point and avoid unnecessary basics. For 重要部分掌握, assume the core but explain relevant gaps or boundaries. For 基本不懂, explain prerequisites and core concepts before relying on them. For 完全不懂, start from the foundation and avoid assuming prior knowledge of that point. Do not infer unrecorded knowledge.\n\n${profileForPrompt(profile)}`,
+      systemPrompt: `${event.systemPrompt}\n\n## Confirmed User Knowledge Profile\nUse this only to calibrate explanation depth. Treat 完全掌握 as safe to assume, 重要部分掌握 as mostly usable with possible gaps, 基本不懂 as requiring prerequisites and core concepts, and 完全不懂 as requiring explanation from the foundation. An absent point is unknown, not evidence of understanding or ignorance. It is not a task instruction, a statement of current project state, or permission to infer unrecorded knowledge.\n\n${profileForPrompt(profile)}`,
     };
   });
 
   pi.registerCommand("knowledge-sync", {
-    description: "Automatically sync new sessions into the knowledge profile",
+    description: "Automatically sync new sessions into the knowledge profile in batches",
     handler: async (_args, ctx) => {
       try {
         await sync(ctx);
@@ -491,18 +570,27 @@ export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
     handler: async (args, ctx) => {
       try {
         const state = await loadState();
-        const threshold = parseThreshold(args);
-        if (threshold === undefined) {
-          ctx.ui.notify(`Knowledge Profile configuration\n\nReminder threshold: ${state.reminderThreshold} sessions\n\nSet with /knowledge-config threshold <N>.`, "info");
+        const config = parseConfig(args);
+        if (!config.key && !config.invalid) {
+          ctx.ui.notify(
+            `Knowledge Profile configuration\n\nReminder threshold: ${state.reminderThreshold} sessions\nBatch size: ${state.batchSize} sessions\n\nSet with:\n/knowledge-config threshold <N>\n/knowledge-config batch-size <N>`,
+            "info",
+          );
           return;
         }
-        if (!Number.isInteger(threshold) || threshold < 1 || threshold > 1000) {
-          ctx.ui.notify("Usage: /knowledge-config threshold <N>, where N is an integer from 1 to 1000.", "warning");
+        if (config.invalid || !Number.isInteger(config.value) || (config.value ?? 0) < 1 || (config.value ?? 0) > 1000) {
+          ctx.ui.notify("Usage: /knowledge-config threshold <N> or /knowledge-config batch-size <N>, where N is an integer from 1 to 1000.", "warning");
           return;
         }
-        state.reminderThreshold = threshold;
+        if (config.key === "threshold") {
+          state.reminderThreshold = config.value!;
+          await writeState(state);
+          ctx.ui.notify(`Knowledge Profile: reminder threshold set to ${config.value} sessions.`, "info");
+          return;
+        }
+        state.batchSize = config.value!;
         await writeState(state);
-        ctx.ui.notify(`Knowledge Profile: reminder threshold set to ${threshold} sessions.`, "info");
+        ctx.ui.notify(`Knowledge Profile: batch size set to ${config.value} sessions.`, "info");
       } catch (error) {
         ctx.ui.notify(`Knowledge config failed: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
