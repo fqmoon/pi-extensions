@@ -4,6 +4,7 @@ import {
   type ExtensionCommandContext,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -12,6 +13,7 @@ const PROFILE_ROOT = join(homedir(), ".pi", "agent", "user-knowledge");
 const PROFILE_PATH = join(PROFILE_ROOT, "profile.json");
 const STATE_PATH = join(PROFILE_ROOT, "state.json");
 const VIEWS_ROOT = join(PROFILE_ROOT, "views");
+const LOG_ENTRY_TYPE = "knowledge-profile-log";
 const MAX_SESSION_CHARS = 24_000;
 const MAX_MESSAGE_CHARS = 6_000;
 const MAX_CANDIDATES_SAFETY = 200;
@@ -75,6 +77,8 @@ type BatchCommitResult = {
   failures: number;
   changes: ProfileChange[];
 };
+type LogKind = "working" | "success" | "warning" | "info" | "error";
+type LogEntry = { kind: LogKind; text: string };
 
 function defaultState(): State {
   return {
@@ -88,6 +92,10 @@ function defaultState(): State {
 
 function emptyProfile(): Profile {
   return { version: 1, domains: [] };
+}
+
+function appendLog(pi: ExtensionAPI, kind: LogKind, text: string): void {
+  pi.appendEntry(LOG_ENTRY_TYPE, { kind, text } satisfies LogEntry);
 }
 
 function validStatus(value: unknown): value is Status {
@@ -329,6 +337,7 @@ const EXTRACTION_SYSTEM = `You extract evidence about both what a user understan
 const RECONCILIATION_SYSTEM = `You reconcile cross-session evidence into an automatically maintained user knowledge profile. Return only a JSON array, with objects exactly {"domain":"...","subdomain":"...","knowledgePoint":"...","suggestedStatus":"完全掌握|重要部分掌握|基本不懂|完全不懂","context":"...","evidence":["concrete evidence"],"reason":"why this status, including why neighbouring statuses are less appropriate"}. The profile is bidirectional: it records both what may be assumed and what should be explained. Unknown or never-discussed knowledge must remain absent, not be classified as ignorance. Use positive and negative evidence together, including repeated moderate evidence across sessions. 完全掌握 means the user demonstrates reliable command including relevant boundaries or application. 重要部分掌握 means the core is usable but some limits remain. 基本不懂 means there is concrete evidence of material gaps, misconceptions, or unstable understanding, while some familiarity may exist. 完全不懂 requires strong explicit evidence of essentially no foundation in that specific knowledge point; never infer it merely from a question, one mistake, or missing evidence. Existing points may move in either direction only when new evidence justifies the change. Keep knowledge points narrow enough that the evidence genuinely supports the status. Include only points for which the evidence justifies an add or update.`;
 
 async function extractEvidence(
+  pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
   state: State,
   transcripts: Transcript[],
@@ -338,10 +347,6 @@ async function extractEvidence(
   const completed: Transcript[] = [];
   const failures: AnalysisFailure[] = [];
   for (const [index, transcript] of transcripts.entries()) {
-    const position = offset + index + 1;
-    const label = `Knowledge Profile: extracting evidence ${position}/${total}`;
-    ctx.ui.setWorkingMessage(label);
-    ctx.ui.setStatus("knowledge-profile", label);
     try {
       const response = await askModel(ctx, EXTRACTION_SYSTEM, `Analyze this one new session. Its file is ${basename(transcript.path)}.\n\n${transcript.text}`);
       const items = parseJsonArray<unknown[]>(response).flatMap((item): Evidence[] => {
@@ -369,7 +374,7 @@ async function extractEvidence(
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       failures.push({ session: basename(transcript.path), reason });
-      ctx.ui.notify(`Knowledge Profile: skipped ${basename(transcript.path)} — ${reason}`, "warning");
+      appendLog(pi, "warning", `跳过 ${basename(transcript.path)} · ${reason}`);
     }
   }
   return { completed, failures };
@@ -414,7 +419,7 @@ function upsertCandidate(profile: Profile, candidate: Candidate): ProfileChange 
 function formatChanges(changes: ProfileChange[], committed: number, failures: number, batchLabel?: string): string {
   const added = changes.filter((item) => item.kind === "added");
   const updated = changes.filter((item) => item.kind === "updated");
-  const lines = [batchLabel ? `Knowledge Profile: ${batchLabel}` : "Knowledge Profile updated", ""];
+  const lines = [batchLabel ? `${batchLabel}` : "Knowledge Profile updated", ""];
   if (added.length > 0) lines.push(`新增 ${added.length}`, ...added.map((item) => `- ${item.path} → ${item.status}`), "");
   if (updated.length > 0) lines.push(`更新 ${updated.length}`, ...updated.map((item) =>
     `- ${item.path}${item.previousStatus === item.status ? ` → ${item.status}` : `: ${item.previousStatus} → ${item.status}`}`), "");
@@ -424,6 +429,7 @@ function formatChanges(changes: ProfileChange[], committed: number, failures: nu
 }
 
 async function commitStaged(
+  pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
   state: State,
   failures = 0,
@@ -440,8 +446,7 @@ async function commitStaged(
   let changes: ProfileChange[] = [];
 
   if (evidence.length > 0) {
-    ctx.ui.setWorkingMessage(`Knowledge Profile: ${batchLabel ?? "reconciling"}…`);
-    ctx.ui.setStatus("knowledge-profile", `Knowledge Profile: ${batchLabel ?? "reconciling evidence"}`);
+    appendLog(pi, "working", `${batchLabel ?? "当前批次"} · 正在聚合证据并更新画像…`);
     const profile = await loadProfile();
     const candidates = await reconcile(ctx, profile, evidence);
     changes = candidates.map((candidate) => upsertCandidate(profile, candidate));
@@ -452,68 +457,66 @@ async function commitStaged(
   state.checkpoints = checkpoints;
   state.staged = {};
   await writeState(state);
-  ctx.ui.notify(formatChanges(changes, staged.length, failures, batchLabel), "info");
+  appendLog(pi, "success", formatChanges(changes, staged.length, failures, batchLabel));
   return { committed: staged.length, failures, changes };
 }
 
-async function sync(ctx: ExtensionCommandContext): Promise<void> {
+async function sync(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
   const state = await loadState();
   const pending = await collectPending(state);
   const total = pendingSessionCount(state, pending);
-  ctx.ui.setWorkingVisible(true);
-  ctx.ui.setWorkingMessage(`Knowledge Profile: preparing ${total} sessions in batches of ${state.batchSize}…`);
-  ctx.ui.setStatus("knowledge-profile", `Knowledge Profile: preparing ${total} sessions`);
 
-  try {
-    if (total === 0) {
-      ctx.ui.notify("Knowledge Profile: no new conversation history to sync.", "info");
-      return;
-    }
-
-    let processed = 0;
-    let totalFailures = 0;
-    let totalAdded = 0;
-    let totalUpdated = 0;
-    let batchNumber = 0;
-    let cursor = 0;
-
-    while (Object.keys(state.staged).length > 0 || cursor < pending.length) {
-      batchNumber += 1;
-      const stagedCount = Object.keys(state.staged).length;
-      const room = Math.max(0, state.batchSize - stagedCount);
-      const batch = pending.slice(cursor, cursor + room);
-      cursor += batch.length;
-
-      const projectedBatches = Math.max(batchNumber, batchNumber + Math.ceil((pending.length - cursor) / state.batchSize));
-      const batchLabel = `batch ${batchNumber}/${projectedBatches}`;
-      let failures = 0;
-
-      if (batch.length > 0) {
-        const extraction = await extractEvidence(ctx, state, batch, processed, total);
-        failures = extraction.failures.length;
-        totalFailures += failures;
-        processed += extraction.completed.length + failures;
-        if (failures > 0) {
-          ctx.ui.notify(`Knowledge Profile: ${batchLabel} extracted ${extraction.completed.length}; skipped ${failures}.`, "warning");
-        }
-      }
-
-      const committed = await commitStaged(ctx, state, failures, batchLabel);
-      totalAdded += committed.changes.filter((item) => item.kind === "added").length;
-      totalUpdated += committed.changes.filter((item) => item.kind === "updated").length;
-
-      if (batch.length === 0 && committed.committed === 0) break;
-    }
-
-    ctx.ui.notify(
-      `Knowledge Profile complete\n\nSessions: ${total}\nBatches: ${batchNumber}\nAdded: ${totalAdded}\nUpdated: ${totalUpdated}\nFailed: ${totalFailures}`,
-      "info",
-    );
-  } finally {
-    ctx.ui.setStatus("knowledge-profile", undefined);
-    ctx.ui.setWorkingMessage();
-    ctx.ui.setWorkingVisible(false);
+  if (total === 0) {
+    appendLog(pi, "info", "没有新的会话需要同步。");
+    return;
   }
+
+  appendLog(pi, "working", `开始同步 ${total} 个会话 · batch size ${state.batchSize}`);
+
+  let processed = 0;
+  let totalFailures = 0;
+  let totalAdded = 0;
+  let totalUpdated = 0;
+  let batchNumber = 0;
+  let cursor = 0;
+
+  while (Object.keys(state.staged).length > 0 || cursor < pending.length) {
+    batchNumber += 1;
+    const stagedCount = Object.keys(state.staged).length;
+    const room = Math.max(0, state.batchSize - stagedCount);
+    const batch = pending.slice(cursor, cursor + room);
+    const batchStart = processed + 1;
+    cursor += batch.length;
+
+    const projectedBatches = Math.max(batchNumber, batchNumber + Math.ceil((pending.length - cursor) / state.batchSize));
+    const batchLabel = `Batch ${batchNumber}/${projectedBatches}`;
+    const batchEnd = Math.min(total, processed + batch.length + stagedCount);
+    let failures = 0;
+
+    appendLog(pi, "working", `${batchLabel} · 正在分析会话 ${batchStart}–${batchEnd}/${total}`);
+
+    if (batch.length > 0) {
+      const extraction = await extractEvidence(pi, ctx, state, batch, processed, total);
+      failures = extraction.failures.length;
+      totalFailures += failures;
+      processed += extraction.completed.length + failures;
+      if (failures > 0) {
+        appendLog(pi, "warning", `${batchLabel} · 成功分析 ${extraction.completed.length}，跳过 ${failures}`);
+      }
+    }
+
+    const committed = await commitStaged(pi, ctx, state, failures, batchLabel);
+    totalAdded += committed.changes.filter((item) => item.kind === "added").length;
+    totalUpdated += committed.changes.filter((item) => item.kind === "updated").length;
+
+    if (batch.length === 0 && committed.committed === 0) break;
+  }
+
+  appendLog(
+    pi,
+    "success",
+    `同步完成\n\n会话：${total}\n批次：${batchNumber}\n新增：${totalAdded}\n更新：${totalUpdated}\n失败：${totalFailures}`,
+  );
 }
 
 function parseConfig(args: string): { key?: "threshold" | "batchSize"; value?: number; invalid?: boolean } {
@@ -529,6 +532,29 @@ function parseConfig(args: string): { key?: "threshold" | "batchSize"; value?: n
 
 export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
   let profile = emptyProfile();
+
+  pi.registerEntryRenderer(LOG_ENTRY_TYPE, (entry, _options, theme) => {
+    const data = entry.data as LogEntry;
+    const prefix = data.kind === "working"
+      ? "◌"
+      : data.kind === "success"
+        ? "✓"
+        : data.kind === "warning"
+          ? "!"
+          : data.kind === "error"
+            ? "×"
+            : "·";
+    const color = data.kind === "success"
+      ? "success"
+      : data.kind === "warning"
+        ? "warning"
+        : data.kind === "error"
+          ? "error"
+          : data.kind === "working"
+            ? "accent"
+            : "muted";
+    return new Text(`${theme.fg(color, prefix)} ${data.text}`);
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     try {
@@ -557,10 +583,10 @@ export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
     description: "Automatically sync new sessions into the knowledge profile in batches",
     handler: async (_args, ctx) => {
       try {
-        await sync(ctx);
+        await sync(pi, ctx);
         profile = await loadProfile();
       } catch (error) {
-        ctx.ui.notify(`Knowledge sync failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+        appendLog(pi, "error", `Knowledge sync failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     },
   });
