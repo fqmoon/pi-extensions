@@ -79,6 +79,15 @@ type BatchCommitResult = {
 };
 type LogKind = "working" | "success" | "warning" | "info" | "error";
 type LogEntry = { kind: LogKind; text: string };
+type UsageTotals = {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  totalTokens: number;
+  calls: number;
+};
+type ModelAnswer = { text: string; callTokens: number };
 
 function defaultState(): State {
   return {
@@ -94,8 +103,18 @@ function emptyProfile(): Profile {
   return { version: 1, domains: [] };
 }
 
+function emptyUsage(): UsageTotals {
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, calls: 0 };
+}
+
 function appendLog(pi: ExtensionAPI, kind: LogKind, text: string): void {
   pi.appendEntry(LOG_ENTRY_TYPE, { kind, text } satisfies LogEntry);
+}
+
+function formatTokens(value: number): string {
+  if (value < 1000) return String(value);
+  if (value < 1_000_000) return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)}k`;
+  return `${(value / 1_000_000).toFixed(1)}m`;
 }
 
 function validStatus(value: unknown): value is Status {
@@ -294,13 +313,25 @@ function profileForPrompt(profile: Profile): string {
   return JSON.stringify(profile).slice(0, 48_000);
 }
 
-async function askModel(ctx: ExtensionContext, systemPrompt: string, prompt: string): Promise<string> {
+async function askModel(
+  ctx: ExtensionContext,
+  usage: UsageTotals,
+  systemPrompt: string,
+  prompt: string,
+): Promise<ModelAnswer> {
   if (!ctx.model) throw new Error("No Pi model is selected. Select a model, then run /knowledge-sync again.");
   const answer = await ctx.modelRegistry.complete(ctx.model, {
     systemPrompt,
     messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
   }, { reasoning: ctx.thinkingLevel });
-  return textContent(answer.content);
+  const callTokens = answer.usage.totalTokens || 0;
+  usage.input += answer.usage.input || 0;
+  usage.output += answer.usage.output || 0;
+  usage.cacheRead += answer.usage.cacheRead || 0;
+  usage.cacheWrite += answer.usage.cacheWrite || 0;
+  usage.totalTokens += callTokens;
+  usage.calls += 1;
+  return { text: textContent(answer.content), callTokens };
 }
 
 function parseJsonArray<T>(text: string): T {
@@ -343,13 +374,20 @@ async function extractEvidence(
   transcripts: Transcript[],
   offset: number,
   total: number,
+  usage: UsageTotals,
 ): Promise<ExtractionResult> {
   const completed: Transcript[] = [];
   const failures: AnalysisFailure[] = [];
   for (const [index, transcript] of transcripts.entries()) {
+    const position = offset + index + 1;
     try {
-      const response = await askModel(ctx, EXTRACTION_SYSTEM, `Analyze this one new session. Its file is ${basename(transcript.path)}.\n\n${transcript.text}`);
-      const items = parseJsonArray<unknown[]>(response).flatMap((item): Evidence[] => {
+      const answer = await askModel(
+        ctx,
+        usage,
+        EXTRACTION_SYSTEM,
+        `Analyze this one new session. Its file is ${basename(transcript.path)}.\n\n${transcript.text}`,
+      );
+      const items = parseJsonArray<unknown[]>(answer.text).flatMap((item): Evidence[] => {
         if (typeof item !== "object" || item === null) return [];
         const raw = item as Record<string, unknown>;
         const evidence = cleanEvidence(raw.evidence);
@@ -371,19 +409,33 @@ async function extractEvidence(
         evidence: [...(staged?.evidence ?? []), ...items],
       };
       await writeState(state);
+      appendLog(
+        pi,
+        "success",
+        `${position}/${total} ${basename(transcript.path)} · evidence ${items.length} · ${formatTokens(answer.callTokens)} tok · total ${formatTokens(usage.totalTokens)}`,
+      );
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       failures.push({ session: basename(transcript.path), reason });
-      appendLog(pi, "warning", `跳过 ${basename(transcript.path)} · ${reason}`);
+      appendLog(pi, "warning", `${position}/${total} ${basename(transcript.path)} · skipped · ${reason}`);
     }
   }
   return { completed, failures };
 }
 
-async function reconcile(ctx: ExtensionContext, profile: Profile, evidence: Evidence[]): Promise<Candidate[]> {
-  const response = await askModel(ctx, RECONCILIATION_SYSTEM,
-    `## Existing profile\n${profileForPrompt(profile)}\n\n## Cross-session evidence\n${JSON.stringify(evidence, null, 2)}`);
-  return normalizeCandidates(parseJsonArray<unknown>(response));
+async function reconcile(
+  ctx: ExtensionContext,
+  profile: Profile,
+  evidence: Evidence[],
+  usage: UsageTotals,
+): Promise<{ candidates: Candidate[]; callTokens: number }> {
+  const answer = await askModel(
+    ctx,
+    usage,
+    RECONCILIATION_SYSTEM,
+    `## Existing profile\n${profileForPrompt(profile)}\n\n## Cross-session evidence\n${JSON.stringify(evidence, null, 2)}`,
+  );
+  return { candidates: normalizeCandidates(parseJsonArray<unknown>(answer.text)), callTokens: answer.callTokens };
 }
 
 function upsertCandidate(profile: Profile, candidate: Candidate): ProfileChange {
@@ -416,15 +468,12 @@ function upsertCandidate(profile: Profile, candidate: Candidate): ProfileChange 
   return { kind: "updated", path, previousStatus, status: point.status };
 }
 
-function formatChanges(changes: ProfileChange[], committed: number, failures: number, batchLabel?: string): string {
+function formatChanges(changes: ProfileChange[], committed: number, failures: number, batchLabel: string, totalTokens: number): string {
   const added = changes.filter((item) => item.kind === "added");
   const updated = changes.filter((item) => item.kind === "updated");
-  const lines = [batchLabel ? `${batchLabel}` : "Knowledge Profile updated", ""];
-  if (added.length > 0) lines.push(`新增 ${added.length}`, ...added.map((item) => `- ${item.path} → ${item.status}`), "");
-  if (updated.length > 0) lines.push(`更新 ${updated.length}`, ...updated.map((item) =>
-    `- ${item.path}${item.previousStatus === item.status ? ` → ${item.status}` : `: ${item.previousStatus} → ${item.status}`}`), "");
-  if (changes.length === 0) lines.push("没有需要更新的知识点。", "");
-  lines.push(`已提交会话：${committed}${failures > 0 ? ` · 跳过失败：${failures}` : ""}`);
+  const lines = [`${batchLabel} · +${added.length} ~${updated.length} · committed ${committed}${failures > 0 ? ` · skipped ${failures}` : ""} · total ${formatTokens(totalTokens)} tok`];
+  for (const item of added) lines.push(`+ ${item.path} → ${item.status}`);
+  for (const item of updated) lines.push(`~ ${item.path}${item.previousStatus === item.status ? ` → ${item.status}` : `: ${item.previousStatus} → ${item.status}`}`);
   return lines.join("\n");
 }
 
@@ -432,8 +481,9 @@ async function commitStaged(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
   state: State,
+  usage: UsageTotals,
   failures = 0,
-  batchLabel?: string,
+  batchLabel = "Batch",
 ): Promise<BatchCommitResult> {
   const staged = Object.entries(state.staged);
   if (staged.length === 0) return { committed: 0, failures, changes: [] };
@@ -446,10 +496,10 @@ async function commitStaged(
   let changes: ProfileChange[] = [];
 
   if (evidence.length > 0) {
-    appendLog(pi, "working", `${batchLabel ?? "当前批次"} · 正在聚合证据并更新画像…`);
+    appendLog(pi, "working", `${batchLabel} · reconciling · total ${formatTokens(usage.totalTokens)} tok`);
     const profile = await loadProfile();
-    const candidates = await reconcile(ctx, profile, evidence);
-    changes = candidates.map((candidate) => upsertCandidate(profile, candidate));
+    const result = await reconcile(ctx, profile, evidence, usage);
+    changes = result.candidates.map((candidate) => upsertCandidate(profile, candidate));
     await writeProfile(profile);
     await renderViews(profile);
   }
@@ -457,7 +507,7 @@ async function commitStaged(
   state.checkpoints = checkpoints;
   state.staged = {};
   await writeState(state);
-  appendLog(pi, "success", formatChanges(changes, staged.length, failures, batchLabel));
+  appendLog(pi, "success", formatChanges(changes, staged.length, failures, batchLabel, usage.totalTokens));
   return { committed: staged.length, failures, changes };
 }
 
@@ -465,13 +515,16 @@ async function sync(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<voi
   const state = await loadState();
   const pending = await collectPending(state);
   const total = pendingSessionCount(state, pending);
+  const usage = emptyUsage();
 
   if (total === 0) {
-    appendLog(pi, "info", "没有新的会话需要同步。");
+    appendLog(pi, "info", "No new sessions to sync.");
     return;
   }
 
-  appendLog(pi, "working", `开始同步 ${total} 个会话 · batch size ${state.batchSize}`);
+  if (!ctx.model) throw new Error("No Pi model is selected. Select a model, then run /knowledge-sync again.");
+  const modelLabel = `${ctx.model.provider}/${ctx.model.id}`;
+  appendLog(pi, "working", `Sync ${total} sessions · batch ${state.batchSize} · ${modelLabel} · thinking ${ctx.thinkingLevel}`);
 
   let processed = 0;
   let totalFailures = 0;
@@ -485,27 +538,20 @@ async function sync(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<voi
     const stagedCount = Object.keys(state.staged).length;
     const room = Math.max(0, state.batchSize - stagedCount);
     const batch = pending.slice(cursor, cursor + room);
-    const batchStart = processed + 1;
     cursor += batch.length;
 
     const projectedBatches = Math.max(batchNumber, batchNumber + Math.ceil((pending.length - cursor) / state.batchSize));
     const batchLabel = `Batch ${batchNumber}/${projectedBatches}`;
-    const batchEnd = Math.min(total, processed + batch.length + stagedCount);
     let failures = 0;
 
-    appendLog(pi, "working", `${batchLabel} · 正在分析会话 ${batchStart}–${batchEnd}/${total}`);
-
     if (batch.length > 0) {
-      const extraction = await extractEvidence(pi, ctx, state, batch, processed, total);
+      const extraction = await extractEvidence(pi, ctx, state, batch, processed, total, usage);
       failures = extraction.failures.length;
       totalFailures += failures;
       processed += extraction.completed.length + failures;
-      if (failures > 0) {
-        appendLog(pi, "warning", `${batchLabel} · 成功分析 ${extraction.completed.length}，跳过 ${failures}`);
-      }
     }
 
-    const committed = await commitStaged(pi, ctx, state, failures, batchLabel);
+    const committed = await commitStaged(pi, ctx, state, usage, failures, batchLabel);
     totalAdded += committed.changes.filter((item) => item.kind === "added").length;
     totalUpdated += committed.changes.filter((item) => item.kind === "updated").length;
 
@@ -515,7 +561,7 @@ async function sync(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<voi
   appendLog(
     pi,
     "success",
-    `同步完成\n\n会话：${total}\n批次：${batchNumber}\n新增：${totalAdded}\n更新：${totalUpdated}\n失败：${totalFailures}`,
+    `Complete · sessions ${total} · batches ${batchNumber} · +${totalAdded} ~${totalUpdated} · failed ${totalFailures} · calls ${usage.calls} · in ${formatTokens(usage.input)} · out ${formatTokens(usage.output)} · cache ${formatTokens(usage.cacheRead)}/${formatTokens(usage.cacheWrite)} · total ${formatTokens(usage.totalTokens)} tok`,
   );
 }
 
@@ -553,7 +599,7 @@ export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
           : data.kind === "working"
             ? "accent"
             : "muted";
-    return new Text(`${theme.fg(color, prefix)} ${data.text}`);
+    return new Text(`${theme.fg(color, prefix)} ${data.text}`, 0, 0);
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -599,7 +645,7 @@ export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
         const config = parseConfig(args);
         if (!config.key && !config.invalid) {
           ctx.ui.notify(
-            `Knowledge Profile configuration\n\nReminder threshold: ${state.reminderThreshold} sessions\nBatch size: ${state.batchSize} sessions\n\nSet with:\n/knowledge-config threshold <N>\n/knowledge-config batch-size <N>`,
+            `Knowledge Profile configuration\nReminder threshold: ${state.reminderThreshold} sessions\nBatch size: ${state.batchSize} sessions\nSet with /knowledge-config threshold <N> or /knowledge-config batch-size <N>`,
             "info",
           );
           return;
