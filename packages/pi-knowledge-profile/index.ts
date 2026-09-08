@@ -4,53 +4,33 @@ import {
   type ExtensionCommandContext,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 const PROFILE_ROOT = join(homedir(), ".pi", "agent", "user-knowledge");
+const PROFILE_PATH = join(PROFILE_ROOT, "profile.json");
 const STATE_PATH = join(PROFILE_ROOT, "state.json");
+const VIEWS_ROOT = join(PROFILE_ROOT, "views");
 const MAX_SESSION_CHARS = 24_000;
 const MAX_MESSAGE_CHARS = 6_000;
-const MAX_CANDIDATES = 24;
+const MAX_CANDIDATES_SAFETY = 200;
+const DEFAULT_REMINDER_THRESHOLD = 5;
 const STATUSES = ["完全掌握", "重要部分掌握", "基本不懂", "完全不懂"] as const;
 
 type Status = (typeof STATUSES)[number];
 type Checkpoint = Record<string, string>;
-type StagedSession = {
-  lastEntryId: string;
-  evidence: Evidence[];
-};
+type StagedSession = { lastEntryId: string; evidence: Evidence[] };
 type State = {
-  version: 1;
-  frequency: "daily" | "weekly";
-  lastPromptAt?: string;
+  version: 2;
+  reminderThreshold: number;
   checkpoints: Checkpoint;
-  // Evidence is staged until its candidates have been reviewed. This keeps an
-  // interrupted initial import resumable without treating it as confirmed.
   staged: Record<string, StagedSession>;
 };
-type Transcript = {
-  path: string;
-  modifiedAt: string;
-  text: string;
-  lastEntryId: string;
-};
-type Evidence = {
-  session: string;
-  context: string;
-  evidence: string[];
-  caution?: string;
-};
-type AnalysisFailure = {
-  session: string;
-  reason: string;
-};
-type ExtractionResult = {
-  evidence: Evidence[];
-  completed: Transcript[];
-  failures: AnalysisFailure[];
-};
+type Transcript = { path: string; modifiedAt: string; text: string; lastEntryId: string };
+type Evidence = { session: string; context: string; evidence: string[]; caution?: string };
+type AnalysisFailure = { session: string; reason: string };
+type ExtractionResult = { completed: Transcript[]; failures: AnalysisFailure[] };
 type Candidate = {
   domain: string;
   subdomain: string;
@@ -60,40 +40,49 @@ type Candidate = {
   evidence: string[];
   reason: string;
 };
+type KnowledgePoint = {
+  name: string;
+  status: Status;
+  context: string;
+  evidence: string[];
+  reason: string;
+  updatedAt: string;
+};
+type Subdomain = { name: string; knowledgePoints: KnowledgePoint[] };
+type Domain = { name: string; subdomains: Subdomain[] };
+type Profile = { version: 1; domains: Domain[] };
+type ProfileChange = {
+  kind: "added" | "updated";
+  path: string;
+  previousStatus?: Status;
+  status: Status;
+};
 
 function defaultState(): State {
-  return { version: 1, frequency: "weekly", checkpoints: {}, staged: {} };
+  return { version: 2, reminderThreshold: DEFAULT_REMINDER_THRESHOLD, checkpoints: {}, staged: {} };
 }
 
-async function loadState(): Promise<State> {
-  try {
-    const parsed = JSON.parse(await readFile(STATE_PATH, "utf8")) as Partial<State>;
-    return {
-      version: 1,
-      frequency: parsed.frequency === "daily" ? "daily" : "weekly",
-      lastPromptAt: typeof parsed.lastPromptAt === "string" ? parsed.lastPromptAt : undefined,
-      checkpoints:
-        parsed.checkpoints && typeof parsed.checkpoints === "object"
-          ? parsed.checkpoints as Checkpoint
-          : {},
-      staged:
-        parsed.staged && typeof parsed.staged === "object"
-          ? Object.fromEntries(Object.entries(parsed.staged).flatMap(([path, item]) => {
-            if (typeof item !== "object" || item === null) return [];
-            const raw = item as Partial<StagedSession>;
-            if (typeof raw.lastEntryId !== "string" || !Array.isArray(raw.evidence)) return [];
-            return [[path, { lastEntryId: raw.lastEntryId, evidence: raw.evidence.filter(isEvidence) }]];
-          }))
-          : {},
-    };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaultState();
-    throw error;
-  }
+function emptyProfile(): Profile {
+  return { version: 1, domains: [] };
+}
+
+function validStatus(value: unknown): value is Status {
+  return typeof value === "string" && (STATUSES as readonly string[]).includes(value);
+}
+
+function cleanEvidence(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 4);
+}
+
+function isEvidence(value: unknown): value is Evidence {
+  if (typeof value !== "object" || value === null) return false;
+  const raw = value as Partial<Evidence>;
+  return typeof raw.session === "string" && typeof raw.context === "string" && cleanEvidence(raw.evidence).length > 0;
 }
 
 async function atomicWrite(path: string, contents: string): Promise<void> {
-  await mkdir(PROFILE_ROOT, { recursive: true });
+  await mkdir(dirname(path), { recursive: true });
   const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(temporary, contents, "utf8");
   await rename(temporary, path);
@@ -103,22 +92,38 @@ async function writeState(state: State): Promise<void> {
   await atomicWrite(STATE_PATH, JSON.stringify(state, null, 2) + "\n");
 }
 
-function isDue(lastPromptAt: string | undefined, frequency: State["frequency"]): boolean {
-  if (!lastPromptAt) return true;
-  const elapsed = Date.now() - new Date(lastPromptAt).getTime();
-  return elapsed >= (frequency === "daily" ? 86_400_000 : 604_800_000);
+async function loadState(): Promise<State> {
+  try {
+    const parsed = JSON.parse(await readFile(STATE_PATH, "utf8")) as Partial<State>;
+    const reminderThreshold = Number.isInteger(parsed.reminderThreshold) && (parsed.reminderThreshold ?? 0) > 0
+      ? parsed.reminderThreshold as number
+      : DEFAULT_REMINDER_THRESHOLD;
+    return {
+      version: 2,
+      reminderThreshold,
+      checkpoints: parsed.checkpoints && typeof parsed.checkpoints === "object" ? parsed.checkpoints : {},
+      staged: parsed.staged && typeof parsed.staged === "object"
+        ? Object.fromEntries(Object.entries(parsed.staged).flatMap(([path, item]) => {
+          if (typeof item !== "object" || item === null) return [];
+          const raw = item as Partial<StagedSession>;
+          if (typeof raw.lastEntryId !== "string" || !Array.isArray(raw.evidence)) return [];
+          return [[path, { lastEntryId: raw.lastEntryId, evidence: raw.evidence.filter(isEvidence) }]];
+        }))
+        : {},
+    };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaultState();
+    throw error;
+  }
 }
 
 function textContent(content: unknown): string {
   if (typeof content === "string") return content.trim();
   if (!Array.isArray(content)) return "";
   return content
-    .filter(
-      (item): item is { type: "text"; text: string } =>
-        typeof item === "object" && item !== null &&
-        "type" in item && item.type === "text" &&
-        "text" in item && typeof item.text === "string",
-    )
+    .filter((item): item is { type: "text"; text: string } =>
+      typeof item === "object" && item !== null && "type" in item && item.type === "text" &&
+      "text" in item && typeof item.text === "string")
     .map((item) => item.text)
     .join("\n\n")
     .trim();
@@ -137,7 +142,6 @@ function pendingBranchEntries(entries: unknown[], checkpoint?: string): unknown[
   const index = entries.findIndex(
     (entry) => typeof entry === "object" && entry !== null && "id" in entry && entry.id === checkpoint,
   );
-  // A branch can abandon the prior checkpoint. Re-read that branch instead of silently losing evidence.
   return index >= 0 ? entries.slice(index + 1) : entries;
 }
 
@@ -147,21 +151,19 @@ async function collectPending(state: State): Promise<Transcript[]> {
   for (const session of sessions) {
     const manager = SessionManager.open(session.path);
     const branch = manager.getBranch();
-    // A staged entry is newer than the confirmed checkpoint. Only extract
-    // additions after it; the prior evidence is already durable in state.json.
-    const pending = pendingBranchEntries(branch, state.staged[session.path]?.lastEntryId ?? state.checkpoints[session.path]);
+    const checkpoint = state.staged[session.path]?.lastEntryId ?? state.checkpoints[session.path];
+    const pending = pendingBranchEntries(branch, checkpoint);
     const messages = pending.map(messageText).filter((value): value is NonNullable<typeof value> => Boolean(value));
     const text = messages.map((message) => `## ${message.role}\n\n${message.text}`).join("\n\n").slice(0, MAX_SESSION_CHARS);
     const last = branch.at(-1);
     if (!text || !last) continue;
-    transcripts.push({
-      path: session.path,
-      modifiedAt: session.modified.toISOString(),
-      text,
-      lastEntryId: last.id,
-    });
+    transcripts.push({ path: session.path, modifiedAt: session.modified.toISOString(), text, lastEntryId: last.id });
   }
   return transcripts.sort((left, right) => left.modifiedAt.localeCompare(right.modifiedAt));
+}
+
+function pendingSessionCount(state: State, pending: Transcript[]): number {
+  return new Set([...Object.keys(state.staged), ...pending.map((item) => item.path)]).size;
 }
 
 function estimateTokens(transcripts: Transcript[]): number {
@@ -174,22 +176,77 @@ function dateRange(transcripts: Transcript[]): string {
   return `${dates[0]}–${dates.at(-1)}`;
 }
 
-async function readProfile(): Promise<string> {
+function isKnowledgePoint(value: unknown): value is KnowledgePoint {
+  if (typeof value !== "object" || value === null) return false;
+  const raw = value as Partial<KnowledgePoint>;
+  return typeof raw.name === "string" && validStatus(raw.status) && typeof raw.context === "string" &&
+    Array.isArray(raw.evidence) && typeof raw.reason === "string" && typeof raw.updatedAt === "string";
+}
+
+function normalizeProfile(value: unknown): Profile {
+  if (typeof value !== "object" || value === null) return emptyProfile();
+  const rawDomains = (value as { domains?: unknown }).domains;
+  if (!Array.isArray(rawDomains)) return emptyProfile();
+  const domains = rawDomains.flatMap((domain): Domain[] => {
+    if (typeof domain !== "object" || domain === null) return [];
+    const raw = domain as { name?: unknown; subdomains?: unknown };
+    if (typeof raw.name !== "string" || !Array.isArray(raw.subdomains)) return [];
+    const subdomains = raw.subdomains.flatMap((subdomain): Subdomain[] => {
+      if (typeof subdomain !== "object" || subdomain === null) return [];
+      const item = subdomain as { name?: unknown; knowledgePoints?: unknown };
+      if (typeof item.name !== "string" || !Array.isArray(item.knowledgePoints)) return [];
+      return [{ name: item.name, knowledgePoints: item.knowledgePoints.filter(isKnowledgePoint) }];
+    });
+    return [{ name: raw.name, subdomains }];
+  });
+  return { version: 1, domains };
+}
+
+async function loadProfile(): Promise<Profile> {
   try {
-    const files = await readdir(PROFILE_ROOT);
-    const markdown = files.filter((file) => file.endsWith(".md")).sort();
-    const content = await Promise.all(markdown.map((file) => readFile(join(PROFILE_ROOT, file), "utf8")));
-    return content.join("\n\n").slice(0, 48_000);
+    return normalizeProfile(JSON.parse(await readFile(PROFILE_PATH, "utf8")));
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyProfile();
     throw error;
   }
 }
 
-function profilePrompt(profile: string): string {
-  return profile
-    ? `\n\n## Confirmed profile\n${profile}`
-    : "\n\n## Confirmed profile\nNo confirmed records yet.";
+async function writeProfile(profile: Profile): Promise<void> {
+  await atomicWrite(PROFILE_PATH, JSON.stringify(profile, null, 2) + "\n");
+}
+
+function safeFilename(value: string): string {
+  const result = value.replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim().slice(0, 80);
+  return result || "General";
+}
+
+function renderDomain(domain: Domain): string {
+  return domain.subdomains.map((subdomain) => [
+    `## ${subdomain.name}`,
+    ...subdomain.knowledgePoints.map((point) => [
+      `### ${point.name}`,
+      "",
+      `- Status: ${point.status}`,
+      `- Context: ${point.context}`,
+      "- Evidence:",
+      ...point.evidence.map((item) => `  - ${item}`),
+      `- Reason: ${point.reason}`,
+      `- Updated: ${point.updatedAt}`,
+    ].join("\n")),
+  ].join("\n\n")).join("\n\n") + "\n";
+}
+
+async function renderViews(profile: Profile): Promise<void> {
+  await mkdir(VIEWS_ROOT, { recursive: true });
+  const existing = (await readdir(VIEWS_ROOT)).filter((file) => file.endsWith(".md"));
+  const desired = new Set(profile.domains.map((domain) => `${safeFilename(domain.name)}.md`));
+  await Promise.all(existing.filter((file) => !desired.has(file)).map((file) => unlink(join(VIEWS_ROOT, file))));
+  await Promise.all(profile.domains.map((domain) =>
+    atomicWrite(join(VIEWS_ROOT, `${safeFilename(domain.name)}.md`), renderDomain(domain))));
+}
+
+function profileForPrompt(profile: Profile): string {
+  return JSON.stringify(profile).slice(0, 48_000);
 }
 
 async function askModel(ctx: ExtensionContext, systemPrompt: string, prompt: string): Promise<string> {
@@ -201,27 +258,12 @@ async function askModel(ctx: ExtensionContext, systemPrompt: string, prompt: str
   return textContent(answer.content);
 }
 
-function parseJson<T>(text: string): T {
+function parseJsonArray<T>(text: string): T {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1] ?? text;
   const start = fenced.indexOf("[");
   const end = fenced.lastIndexOf("]");
   if (start < 0 || end < start) throw new Error("The analysis model did not return a JSON array.");
   return JSON.parse(fenced.slice(start, end + 1)) as T;
-}
-
-function validStatus(value: unknown): value is Status {
-  return typeof value === "string" && (STATUSES as readonly string[]).includes(value);
-}
-
-function cleanEvidence(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 4);
-}
-
-function isEvidence(value: unknown): value is Evidence {
-  if (typeof value !== "object" || value === null) return false;
-  const raw = value as Partial<Evidence>;
-  return typeof raw.session === "string" && typeof raw.context === "string" && cleanEvidence(raw.evidence).length > 0;
 }
 
 function normalizeCandidates(value: unknown): Candidate[] {
@@ -231,25 +273,25 @@ function normalizeCandidates(value: unknown): Candidate[] {
     const raw = item as Record<string, unknown>;
     if (!["domain", "subdomain", "knowledgePoint", "context", "reason"].every((key) => typeof raw[key] === "string") || !validStatus(raw.suggestedStatus)) return [];
     const evidence = cleanEvidence(raw.evidence);
-    if (evidence.length === 0) return [];
-    const domain = raw.domain as string;
-    const subdomain = raw.subdomain as string;
-    const knowledgePoint = raw.knowledgePoint as string;
-    const context = raw.context as string;
-    const reason = raw.reason as string;
-    return [{
-      domain: domain.trim(), subdomain: subdomain.trim(), knowledgePoint: knowledgePoint.trim(),
-      suggestedStatus: raw.suggestedStatus, context: context.trim(), evidence, reason: reason.trim(),
-    }].filter((candidate) => candidate.domain && candidate.subdomain && candidate.knowledgePoint && candidate.context && candidate.reason);
-  }).slice(0, MAX_CANDIDATES);
+    if (evidence.length === 0 || raw.suggestedStatus === "完全不懂") return [];
+    const candidate: Candidate = {
+      domain: (raw.domain as string).trim(),
+      subdomain: (raw.subdomain as string).trim(),
+      knowledgePoint: (raw.knowledgePoint as string).trim(),
+      suggestedStatus: raw.suggestedStatus,
+      context: (raw.context as string).trim(),
+      evidence,
+      reason: (raw.reason as string).trim(),
+    };
+    return candidate.domain && candidate.subdomain && candidate.knowledgePoint && candidate.context && candidate.reason ? [candidate] : [];
+  }).slice(0, MAX_CANDIDATES_SAFETY);
 }
 
 const EXTRACTION_SYSTEM = `You extract conservative evidence about a user's demonstrated knowledge from a Pi conversation. Do not infer ignorance from questions, challenges, requests for explanation, use of one term, or accepting an answer. Do not assess preferences, personality, task state, or the assistant's knowledge. Return only a JSON array. Each object: {"session":"short label","context":"what was being discussed","evidence":["specific user reasoning or correction"],"caution":"why this remains limited"}. Return [] when evidence is weak.`;
 
-const RECONCILIATION_SYSTEM = `You reconcile evidence into a user-reviewable knowledge profile. Return only a JSON array, with objects exactly {"domain":"...","subdomain":"...","knowledgePoint":"...","suggestedStatus":"完全掌握|重要部分掌握|基本不懂|完全不懂","context":"...","evidence":["concrete evidence"],"reason":"why this status, including why it is not a stronger neighbouring status"}. Be conservative. Do not create a broad point where evidence supports only a narrow one. A question alone is never evidence of not understanding. Include only candidates that need a user decision.`;
+const RECONCILIATION_SYSTEM = `You reconcile evidence into an automatically maintained knowledge profile. Return only a JSON array, with objects exactly {"domain":"...","subdomain":"...","knowledgePoint":"...","suggestedStatus":"完全掌握|重要部分掌握|基本不懂","context":"...","evidence":["concrete evidence"],"reason":"why this status, including why it is not a stronger neighbouring status"}. Be conservative. Do not create a broad point where evidence supports only a narrow one. A question alone is never evidence of not understanding. Never infer 完全不懂 automatically. Include only points for which the new evidence justifies an add or update.`;
 
 async function extractEvidence(ctx: ExtensionCommandContext, state: State, transcripts: Transcript[]): Promise<ExtractionResult> {
-  const output: Evidence[] = [];
   const completed: Transcript[] = [];
   const failures: AnalysisFailure[] = [];
   for (const [index, transcript] of transcripts.entries()) {
@@ -258,18 +300,12 @@ async function extractEvidence(ctx: ExtensionCommandContext, state: State, trans
     ctx.ui.setStatus("knowledge-profile", label);
     try {
       const response = await askModel(ctx, EXTRACTION_SYSTEM, `Analyze this one new session. Its file is ${basename(transcript.path)}.\n\n${transcript.text}`);
-      const items = parseJson<Evidence[]>(response).filter((item) =>
-        typeof item?.context === "string" && cleanEvidence(item.evidence).length > 0,
-      ).map((item) => ({ ...item, session: basename(transcript.path), evidence: cleanEvidence(item.evidence) }));
-      output.push(...items);
+      const items = parseJsonArray<Evidence[]>(response)
+        .filter((item) => typeof item?.context === "string" && cleanEvidence(item.evidence).length > 0)
+        .map((item) => ({ ...item, session: basename(transcript.path), evidence: cleanEvidence(item.evidence) }));
       completed.push(transcript);
       const staged = state.staged[transcript.path];
-      state.staged[transcript.path] = {
-        lastEntryId: transcript.lastEntryId,
-        evidence: [...(staged?.evidence ?? []), ...items],
-      };
-      // Persist each successful extraction. Stopping a long first run therefore
-      // leaves a reviewable batch instead of discarding its completed work.
+      state.staged[transcript.path] = { lastEntryId: transcript.lastEntryId, evidence: [...(staged?.evidence ?? []), ...items] };
       await writeState(state);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
@@ -277,95 +313,79 @@ async function extractEvidence(ctx: ExtensionCommandContext, state: State, trans
       ctx.ui.notify(`Knowledge Profile: skipped ${basename(transcript.path)} — ${reason}`, "warning");
     }
   }
-  return { evidence: output, completed, failures };
+  return { completed, failures };
 }
 
-async function reconcile(ctx: ExtensionContext, profile: string, evidence: Evidence[]): Promise<Candidate[]> {
-  const response = await askModel(ctx, RECONCILIATION_SYSTEM, `## Existing confirmed profile${profilePrompt(profile)}\n\n## Cross-session evidence\n${JSON.stringify(evidence, null, 2)}`);
-  return normalizeCandidates(parseJson<unknown>(response));
+async function reconcile(ctx: ExtensionContext, profile: Profile, evidence: Evidence[]): Promise<Candidate[]> {
+  const response = await askModel(ctx, RECONCILIATION_SYSTEM,
+    `## Existing profile\n${profileForPrompt(profile)}\n\n## Cross-session evidence\n${JSON.stringify(evidence, null, 2)}`);
+  return normalizeCandidates(parseJsonArray<unknown>(response));
 }
 
-function safeFilename(value: string): string {
-  const result = value.replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim().slice(0, 80);
-  return result || "General";
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function candidateBlock(candidate: Candidate, status: Status): string {
-  return `### ${candidate.knowledgePoint}\n\n- Status: ${status}\n- Context: ${candidate.context}\n- Evidence:\n${candidate.evidence.map((item) => `  - ${item}`).join("\n")}\n- Reason: ${candidate.reason}\n`;
-}
-
-async function writeCandidate(candidate: Candidate, status: Status): Promise<void> {
-  const path = join(PROFILE_ROOT, `${safeFilename(candidate.domain)}.md`);
-  let content = "";
-  try { content = await readFile(path, "utf8"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  const sectionHeader = `## ${candidate.subdomain}`;
-  const block = candidateBlock(candidate, status);
-  const heading = `### ${candidate.knowledgePoint}`;
-  const existing = new RegExp(`^${escapeRegExp(heading)}\\n[\\s\\S]*?(?=^### |^## |\\Z)`, "m");
-  if (existing.test(content)) {
-    content = content.replace(existing, block);
-  } else if (content.includes(sectionHeader)) {
-    const position = content.indexOf(sectionHeader) + sectionHeader.length;
-    content = `${content.slice(0, position)}\n\n${block}${content.slice(position)}`;
-  } else {
-    content = `${content.trimEnd()}${content.trim() ? "\n\n" : ""}${sectionHeader}\n\n${block}`;
+function upsertCandidate(profile: Profile, candidate: Candidate): ProfileChange {
+  let domain = profile.domains.find((item) => item.name === candidate.domain);
+  if (!domain) {
+    domain = { name: candidate.domain, subdomains: [] };
+    profile.domains.push(domain);
   }
-  await atomicWrite(path, content);
-}
-
-async function review(ctx: ExtensionCommandContext, candidates: Candidate[]): Promise<Array<{ candidate: Candidate; status: Status }>> {
-  const accepted: Array<{ candidate: Candidate; status: Status }> = [];
-  for (const candidate of candidates) {
-    const detail = [
-      `${candidate.domain} / ${candidate.subdomain} / ${candidate.knowledgePoint}`,
-      `建议：${candidate.suggestedStatus}`,
-      "", `上下文：${candidate.context}`,
-      "", "证据：", ...candidate.evidence.map((item) => `- ${item}`),
-      "", `理由：${candidate.reason}`,
-    ].join("\n");
-    ctx.ui.notify(detail, "info");
-    const choice = await ctx.ui.select("Knowledge Profile review", [...STATUSES, "保持原状态", "不记录"]);
-    if (!choice) throw new Error("Review cancelled; no profile changes or checkpoints were written.");
-    if (validStatus(choice)) {
-      accepted.push({ candidate, status: choice });
-    }
+  let subdomain = domain.subdomains.find((item) => item.name === candidate.subdomain);
+  if (!subdomain) {
+    subdomain = { name: candidate.subdomain, knowledgePoints: [] };
+    domain.subdomains.push(subdomain);
   }
-  return accepted;
+  const path = `${candidate.domain} / ${candidate.subdomain} / ${candidate.knowledgePoint}`;
+  const existing = subdomain.knowledgePoints.find((item) => item.name === candidate.knowledgePoint);
+  const point: KnowledgePoint = {
+    name: candidate.knowledgePoint,
+    status: candidate.suggestedStatus,
+    context: candidate.context,
+    evidence: candidate.evidence,
+    reason: candidate.reason,
+    updatedAt: new Date().toISOString(),
+  };
+  if (!existing) {
+    subdomain.knowledgePoints.push(point);
+    return { kind: "added", path, status: point.status };
+  }
+  const previousStatus = existing.status;
+  Object.assign(existing, point);
+  return { kind: "updated", path, previousStatus, status: point.status };
 }
 
-async function reviewStaged(ctx: ExtensionCommandContext, state: State): Promise<void> {
+function formatChanges(changes: ProfileChange[], committed: number, failures: number): string {
+  const added = changes.filter((item) => item.kind === "added");
+  const updated = changes.filter((item) => item.kind === "updated");
+  const lines = ["Knowledge Profile updated", ""];
+  if (added.length > 0) lines.push(`新增 ${added.length}`, ...added.map((item) => `- ${item.path} → ${item.status}`), "");
+  if (updated.length > 0) lines.push(`更新 ${updated.length}`, ...updated.map((item) =>
+    `- ${item.path}${item.previousStatus === item.status ? ` → ${item.status}` : `: ${item.previousStatus} → ${item.status}`}`), "");
+  if (changes.length === 0) lines.push("没有需要更新的知识点。", "");
+  lines.push(`已提交会话：${committed}${failures > 0 ? ` · 跳过失败：${failures}` : ""}`);
+  return lines.join("\n");
+}
+
+async function commitStaged(ctx: ExtensionCommandContext, state: State, failures = 0): Promise<void> {
   const staged = Object.entries(state.staged);
   if (staged.length === 0) {
-    ctx.ui.notify("Knowledge Profile: no extracted sessions are waiting for review.", "info");
+    ctx.ui.notify("Knowledge Profile: no new conversation history to sync.", "info");
     return;
   }
+  const checkpoints = { ...state.checkpoints, ...Object.fromEntries(staged.map(([path, item]) => [path, item.lastEntryId])) };
   const evidence = staged.flatMap(([, item]) => item.evidence);
-  const checkpoints = {
-    ...state.checkpoints,
-    ...Object.fromEntries(staged.map(([path, item]) => [path, item.lastEntryId])),
-  };
   if (evidence.length === 0) {
     await writeState({ ...state, checkpoints, staged: {} });
-    ctx.ui.notify(`Knowledge Profile: no sufficiently strong evidence found in ${staged.length} extracted sessions.`, "info");
+    ctx.ui.notify(`Knowledge Profile: no sufficiently strong evidence found; committed ${staged.length} sessions.`, "info");
     return;
   }
   ctx.ui.setWorkingMessage("Knowledge Profile: reconciling cross-session evidence…");
   ctx.ui.setStatus("knowledge-profile", "Knowledge Profile: reconciling evidence");
-  const candidates = await reconcile(ctx, await readProfile(), evidence);
-  if (candidates.length === 0) {
-    await writeState({ ...state, checkpoints, staged: {} });
-    ctx.ui.notify(`Knowledge Profile: no new candidate needs review; committed ${staged.length} extracted sessions.`, "info");
-    return;
-  }
-  ctx.ui.setWorkingMessage("Knowledge Profile: awaiting review…");
-  const accepted = await review(ctx, candidates);
-  for (const item of accepted) await writeCandidate(item.candidate, item.status);
+  const profile = await loadProfile();
+  const candidates = await reconcile(ctx, profile, evidence);
+  const changes = candidates.map((candidate) => upsertCandidate(profile, candidate));
+  await writeProfile(profile);
+  await renderViews(profile);
   await writeState({ ...state, checkpoints, staged: {} });
-  ctx.ui.notify(`Knowledge Profile: reviewed ${candidates.length} candidates; recorded ${accepted.length}; committed ${staged.length} extracted sessions.`, "info");
+  ctx.ui.notify(formatChanges(changes, staged.length, failures), "info");
 }
 
 async function sync(ctx: ExtensionCommandContext): Promise<void> {
@@ -375,13 +395,13 @@ async function sync(ctx: ExtensionCommandContext): Promise<void> {
   ctx.ui.setWorkingMessage(`Knowledge Profile: preparing ${pending.length} sessions…`);
   ctx.ui.setStatus("knowledge-profile", `Knowledge Profile: preparing ${pending.length} sessions`);
   try {
+    let failures = 0;
     if (pending.length > 0) {
       const extraction = await extractEvidence(ctx, state, pending);
-      if (extraction.failures.length > 0) {
-        ctx.ui.notify(`Knowledge Profile: extracted ${extraction.completed.length}; skipped ${extraction.failures.length}. Extracted sessions are ready for /knowledge-review.`, "warning");
-      }
+      failures = extraction.failures.length;
+      if (failures > 0) ctx.ui.notify(`Knowledge Profile: extracted ${extraction.completed.length}; skipped ${failures}.`, "warning");
     }
-    await reviewStaged(ctx, state);
+    await commitStaged(ctx, state, failures);
   } finally {
     ctx.ui.setStatus("knowledge-profile", undefined);
     ctx.ui.setWorkingMessage();
@@ -389,17 +409,27 @@ async function sync(ctx: ExtensionCommandContext): Promise<void> {
   }
 }
 
+function parseThreshold(args: string): number | undefined {
+  const normalized = args.trim();
+  if (!normalized) return;
+  const match = normalized.match(/^(?:threshold\s+)?(\d+)$/i);
+  if (!match) return Number.NaN;
+  return Number(match[1]);
+}
+
 export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
-  let profile = "";
+  let profile = emptyProfile();
+
   pi.on("session_start", async (_event, ctx) => {
     try {
-      profile = await readProfile();
+      profile = await loadProfile();
       const state = await loadState();
-      if (!isDue(state.lastPromptAt, state.frequency)) return;
       const pending = await collectPending(state);
-      if (pending.length > 0) {
-        await atomicWrite(STATE_PATH, JSON.stringify({ ...state, lastPromptAt: new Date().toISOString() }, null, 2) + "\n");
-        ctx.ui.notify(`Knowledge Profile: ${pending.length} pending sessions · ~${estimateTokens(pending).toLocaleString()} tokens · ${dateRange(pending)}. Run /knowledge-sync to review updates.`, "info");
+      const count = pendingSessionCount(state, pending);
+      if (count >= state.reminderThreshold) {
+        const tokenText = pending.length > 0 ? ` · ~${estimateTokens(pending).toLocaleString()} tokens` : "";
+        const rangeText = pending.length > 0 ? ` · ${dateRange(pending)}` : "";
+        ctx.ui.notify(`Knowledge Profile: ${count} pending sessions${tokenText}${rangeText}. Run /knowledge-sync to update.`, "info");
       }
     } catch (error) {
       ctx.ui.notify(`Knowledge Profile startup check failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
@@ -407,37 +437,43 @@ export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", (event) => {
-    if (!profile) return;
+    if (profile.domains.length === 0) return;
     return {
-      systemPrompt: `${event.systemPrompt}\n\n## Confirmed User Knowledge Profile\nUse this only to calibrate explanation depth. It is not a task instruction, a statement of current project state, or permission to infer unrecorded knowledge.\n\n${profile}`,
+      systemPrompt: `${event.systemPrompt}\n\n## Confirmed User Knowledge Profile\nUse this only to calibrate explanation depth. It is not a task instruction, a statement of current project state, or permission to infer unrecorded knowledge.\n\n${profileForPrompt(profile)}`,
     };
   });
 
   pi.registerCommand("knowledge-sync", {
-    description: "Review new sessions and update the confirmed knowledge profile",
+    description: "Automatically sync new sessions into the knowledge profile",
     handler: async (_args, ctx) => {
       try {
         await sync(ctx);
-        profile = await readProfile();
+        profile = await loadProfile();
       } catch (error) {
         ctx.ui.notify(`Knowledge sync failed: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
     },
   });
 
-  pi.registerCommand("knowledge-review", {
-    description: "Review evidence already extracted from sessions and update the knowledge profile",
-    handler: async (_args, ctx) => {
+  pi.registerCommand("knowledge-config", {
+    description: "Show or change Knowledge Profile configuration",
+    handler: async (args, ctx) => {
       try {
-        ctx.ui.setWorkingVisible(true);
-        await reviewStaged(ctx, await loadState());
-        profile = await readProfile();
+        const state = await loadState();
+        const threshold = parseThreshold(args);
+        if (threshold === undefined) {
+          ctx.ui.notify(`Knowledge Profile configuration\n\nReminder threshold: ${state.reminderThreshold} sessions\n\nSet with /knowledge-config threshold <N>.`, "info");
+          return;
+        }
+        if (!Number.isInteger(threshold) || threshold < 1 || threshold > 1000) {
+          ctx.ui.notify("Usage: /knowledge-config threshold <N>, where N is an integer from 1 to 1000.", "warning");
+          return;
+        }
+        state.reminderThreshold = threshold;
+        await writeState(state);
+        ctx.ui.notify(`Knowledge Profile: reminder threshold set to ${threshold} sessions.`, "info");
       } catch (error) {
-        ctx.ui.notify(`Knowledge review failed: ${error instanceof Error ? error.message : String(error)}`, "error");
-      } finally {
-        ctx.ui.setStatus("knowledge-profile", undefined);
-        ctx.ui.setWorkingMessage();
-        ctx.ui.setWorkingVisible(false);
+        ctx.ui.notify(`Knowledge config failed: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
     },
   });

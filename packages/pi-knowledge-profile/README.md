@@ -1,8 +1,8 @@
 # pi-knowledge-profile
 
-An evidence-backed, user-confirmed knowledge profile for [Pi](https://pi.dev/).
+An evidence-backed Pi extension that automatically maintains a user knowledge profile across sessions.
 
-It is deliberately not a general memory system. It records only what the user has reviewed and confirmed about their knowledge, so Pi can safely choose what to take as an explanation prerequisite.
+It is not a general memory system. It records knowledge states only when conversation evidence is strong enough, so the Agent can calibrate explanation depth. Syncs are automatic after the user invokes the command, and every run reports what changed so the user can correct the profile through normal conversation.
 
 ## Install
 
@@ -10,47 +10,47 @@ It is deliberately not a general memory system. It records only what the user ha
 pi install npm:pi-knowledge-profile
 ```
 
-## Workflow
+## Usage
 
-At the first Pi startup after the weekly reminder period, the extension loads the confirmed profile and shows a non-blocking notification when unprocessed sessions exist:
+At startup, the extension counts unsynced sessions. When the count reaches the configured threshold, 5 by default, Pi shows a non-blocking reminder. Startup never calls a model or performs a sync.
+
+Run:
 
 ```text
-Knowledge Profile: 12 pending sessions · ~48k tokens · 2026-09-01–2026-09-08.
-Run /knowledge-sync to review updates.
+/knowledge-sync
 ```
 
-`/knowledge-sync` then:
+The sync extracts conservative evidence session by session, reconciles it across sessions, automatically updates `profile.json`, regenerates Markdown views, advances checkpoints, and displays added or updated knowledge points.
 
-1. scans only new entries since the last completed sync;
-2. extracts conservative evidence per session with the selected Pi model;
-3. reconciles evidence across sessions into candidates;
-4. shows each candidate's context, evidence, and reason, then asks for a user decision;
-5. atomically writes accepted records to domain Markdown files and advances the checkpoint.
+A failed session is skipped rather than aborting the batch. Evidence from every successful extraction is immediately staged in `state.json`, so an interrupted run can resume on the next `/knowledge-sync`.
 
-Each successfully extracted session is immediately staged in `state.json`, without advancing its checkpoint. If a large first sync is stopped, run `/knowledge-review` to reconcile and review the already extracted sessions immediately. A successful review writes the profile, advances those session checkpoints, and clears the staged batch. Until that point, the staged evidence remains resumable and is not treated as confirmed knowledge.
+## Configuration
 
-The command is the only path that runs analysis or changes the profile. Startup never opens a modal or calls a model.
+```text
+/knowledge-config
+/knowledge-config threshold 10
+```
+
+The default reminder threshold is 5 pending sessions.
 
 ## Storage
 
-The profile is stored under `~/.pi/agent/user-knowledge/`:
-
 ```text
-state.json                 # schedule, staged evidence, and per-session checkpoints
-Graphics.md                # one Markdown file per domain
-Software engineering.md
+~/.pi/agent/user-knowledge/
+  profile.json        # canonical structured profile
+  state.json          # reminder threshold, staged evidence, checkpoints
+  views/              # Markdown generated one-way from profile.json
+    Git.md
+    WebGPU.md
 ```
 
-Each confirmed item uses exactly three knowledge levels: domain, subdomain, and knowledge point. The statuses are `完全掌握`, `重要部分掌握`, `基本不懂`, and `完全不懂`. An absent item means no confirmed judgement, not lack of knowledge.
+`profile.json` uses a fixed Domain → Subdomain → Knowledge Point hierarchy. Each point stores status, context, evidence, reason, and `updatedAt`.
 
-## Safety rules
+Markdown is a derived view only and is never parsed back into JSON.
 
-- A question, a one-off term, `懂了`, or accepting an explanation is not enough evidence by itself.
-- Every candidate contains distinct context, concrete evidence, and reasoning.
-- The user may keep the current state or decline to record an item.
-- Tool output, system prompts, and raw logs are excluded from the analysis input.
-- Session checkpoints advance only after the review finishes successfully.
+## Constraints
 
-## Limits of the first release
-
-The review UI intentionally uses Pi's standard selector rather than a custom panel. Candidate generation is bounded per session to control cost. The default reminder frequency is weekly; edit `state.json` and set `"frequency": "daily"` to use a daily reminder.
+- A question, isolated terminology use, acknowledgement, or acceptance is not enough evidence by itself.
+- Tool output, system prompts, and raw logs are excluded from analysis input.
+- `完全不懂` is never inferred automatically.
+- The old 24-candidate review limit is removed; only a much higher internal safety cap remains.
