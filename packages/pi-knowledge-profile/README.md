@@ -20,9 +20,9 @@ Run:
 /knowledge-sync
 ```
 
-The sync extracts positive and negative knowledge evidence session by session, reconciles it across sessions, automatically updates `profile.json`, regenerates Markdown views, advances checkpoints, and displays added or updated knowledge points.
+Sync runs in batches of 20 sessions by default. Each batch independently extracts positive and negative knowledge evidence, reconciles it against the current profile, updates `profile.json`, regenerates Markdown views, advances that batch's checkpoints, and immediately displays the batch diff. Large first-time imports therefore produce profile updates progressively instead of waiting for every session to finish.
 
-A failed session is skipped rather than aborting the batch. Evidence from every successful extraction is immediately staged in `state.json`, so an interrupted run can resume on the next `/knowledge-sync`.
+A failed session is skipped rather than aborting the batch. Evidence from every successful extraction is immediately staged in `state.json`. If sync is interrupted, completed batches are already committed and extracted evidence from the current batch remains staged for the next `/knowledge-sync`.
 
 ## Knowledge states
 
@@ -42,16 +42,17 @@ Extraction labels evidence as `positive | negative` and `strong | moderate`. Neg
 ```text
 /knowledge-config
 /knowledge-config threshold 10
+/knowledge-config batch-size 50
 ```
 
-The default reminder threshold is 5 pending sessions.
+The default reminder threshold is 5 pending sessions. The default batch size is 20 sessions.
 
 ## Storage
 
 ```text
 ~/.pi/agent/user-knowledge/
   profile.json        # canonical structured profile
-  state.json          # reminder threshold, staged evidence, checkpoints
+  state.json          # reminder threshold, batch size, staged evidence, checkpoints
   views/              # Markdown generated one-way from profile.json
     Git.md
     WebGPU.md
