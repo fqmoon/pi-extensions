@@ -12,7 +12,15 @@ pi install npm:pi-knowledge-profile
 
 ## 使用
 
-启动时会统计尚未同步的会话。默认累计到 5 个待同步会话后，Pi 给出非阻塞提示：
+启动时会加载 `profile.json`，并提示本次可注入 Profile 的长度，例如：
+
+```text
+Knowledge Profile injection: 1.2k/48k chars
+```
+
+默认最大注入长度为 48,000 字符。如果完整 Profile 超过限制，启动时会明确显示 `truncated` 并额外打印警告；实际注入内容会按当前配置截断。
+
+启动时也会统计尚未同步的会话。默认累计到 5 个待同步会话后，Pi 给出非阻塞提示：
 
 ```text
 Knowledge Profile: 7 pending sessions · ~31,000 tokens · 2026-09-01–2026-09-08.
@@ -29,7 +37,7 @@ Run /knowledge-sync to update.
 
 同步默认每 20 个会话为一批。每批都会独立执行：逐会话提取正向和负向知识证据 → 跨会话聚合 → 自动更新 `profile.json` → 重新生成 Markdown 视图 → 推进这一批 checkpoint → 立即显示本批新增和更新内容。完成一批后再继续下一批，因此首次扫描几百个会话时会阶段性产出画像，而不是等所有会话都分析完成后才第一次写入。
 
-同步过程的进度和结果会作为持久的 custom entry 直接显示在当前会话 transcript 中，包括开始同步、当前批次、聚合阶段、本批 diff、跳过失败以及最终汇总。它们不使用底部 `working/status` 区域，也不会进入 LLM context。`◌` 表示正在处理，`✓` 表示阶段完成，`!` 表示警告，`×` 表示失败。
+同步过程的进度和结果会作为持久的 custom entry 直接显示在当前会话 transcript 中。每个 session 完成后都会更新一次，并显示证据数量、单次真实 token 用量和累计 token；同步开始时会显示实际调用模型与 thinking level。批次边界仍会显示 reconciliation 和本批 profile diff。它们不使用底部 `working/status` 区域，也不会进入 LLM context。`◌` 表示正在处理，`✓` 表示阶段完成，`!` 表示警告，`×` 表示失败。
 
 单个会话提取失败会跳过并继续。每个成功会话的证据会立即暂存到 `state.json`；如果同步中断，已完成批次已经正式写入，当前批次中已提取的证据仍保留在 staged，下一次 `/knowledge-sync` 会继续处理。
 
@@ -66,7 +74,13 @@ Run /knowledge-sync to update.
 /knowledge-config batch-size 50
 ```
 
-默认提醒阈值为 5 个待同步会话，默认 batch size 为 20 个会话。
+修改 Profile 最大注入长度：
+
+```text
+/knowledge-config profile-max-chars 64000
+```
+
+默认值：提醒阈值 5 个待同步会话，batch size 20 个会话，Profile 最大注入长度 48,000 字符。`profile-max-chars` 可配置范围为 1,000–1,000,000。
 
 ## 存储
 
@@ -74,7 +88,7 @@ Run /knowledge-sync to update.
 
 ```text
 profile.json        # 唯一真源，结构化知识画像
-state.json          # reminder threshold、batch size、staged evidence、checkpoints
+state.json          # reminder threshold、batch size、profile max chars、staged evidence、checkpoints
 views/              # 从 profile.json 单向生成的人类可读 Markdown
   Git.md
   WebGPU.md
