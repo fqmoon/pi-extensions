@@ -27,9 +27,9 @@ Run /knowledge-sync to update.
 /knowledge-sync
 ```
 
-同步流程：逐会话提取正向和负向知识证据 → 跨会话聚合 → 自动更新 `profile.json` → 重新生成 Markdown 视图 → 推进 checkpoint → 显示新增和更新内容。
+同步默认每 20 个会话为一批。每批都会独立执行：逐会话提取正向和负向知识证据 → 跨会话聚合 → 自动更新 `profile.json` → 重新生成 Markdown 视图 → 推进这一批 checkpoint → 立即显示本批新增和更新内容。完成一批后再继续下一批，因此首次扫描几百个会话时会阶段性产出画像，而不是等所有会话都分析完成后才第一次写入。
 
-单个会话提取失败会跳过并继续。每个成功会话的证据会立即暂存到 `state.json`，因此中断后再次运行 `/knowledge-sync` 可以继续处理。
+单个会话提取失败会跳过并继续。每个成功会话的证据会立即暂存到 `state.json`；如果同步中断，已完成批次已经正式写入，当前批次中已提取的证据仍保留在 staged，下一次 `/knowledge-sync` 会继续处理。
 
 ## 知识状态
 
@@ -58,7 +58,13 @@ Run /knowledge-sync to update.
 /knowledge-config threshold 10
 ```
 
-默认阈值为 5 个待同步会话。
+修改批大小：
+
+```text
+/knowledge-config batch-size 50
+```
+
+默认提醒阈值为 5 个待同步会话，默认 batch size 为 20 个会话。
 
 ## 存储
 
@@ -66,7 +72,7 @@ Run /knowledge-sync to update.
 
 ```text
 profile.json        # 唯一真源，结构化知识画像
-state.json          # reminder threshold、staged evidence、checkpoints
+state.json          # reminder threshold、batch size、staged evidence、checkpoints
 views/              # 从 profile.json 单向生成的人类可读 Markdown
   Git.md
   WebGPU.md
