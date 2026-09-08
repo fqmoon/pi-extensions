@@ -19,3 +19,13 @@ Location: [`packages/pi-chat-tail`](./packages/pi-chat-tail)
 The optional positional argument is the number of recent user/assistant messages to save. It defaults to `1`.
 
 Each extension is kept as an independent package so it can be published to npm separately while remaining in this monorepo.
+
+### knowledge-profile
+
+Maintain a reviewable, evidence-backed profile of the user's confirmed knowledge across Pi sessions.
+
+Location: [`packages/pi-knowledge-profile`](./packages/pi-knowledge-profile)
+
+```text
+/knowledge-sync
+```

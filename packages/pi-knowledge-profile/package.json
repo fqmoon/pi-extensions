@@ -1,0 +1,42 @@
+{
+  "name": "pi-knowledge-profile",
+  "version": "0.1.0",
+  "description": "Pi extension for maintaining an evidence-backed user knowledge profile across sessions.",
+  "type": "module",
+  "files": [
+    "index.ts",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi",
+    "pi-agent",
+    "pi-extension",
+    "knowledge-profile",
+    "memory",
+    "pi-package"
+  ],
+  "author": "fqmoon",
+  "license": "MIT",
+  "homepage": "https://github.com/fqmoon/pi-extensions/tree/main/packages/pi-knowledge-profile#readme",
+  "bugs": {
+    "url": "https://github.com/fqmoon/pi-extensions/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fqmoon/pi-extensions.git",
+    "directory": "packages/pi-knowledge-profile"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
