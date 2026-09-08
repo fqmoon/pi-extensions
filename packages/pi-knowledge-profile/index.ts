@@ -225,7 +225,7 @@ async function extractEvidence(ctx: ExtensionCommandContext, transcripts: Transc
   const completed: Transcript[] = [];
   const failures: AnalysisFailure[] = [];
   for (const [index, transcript] of transcripts.entries()) {
-    const label = `Knowledge Profile: analyzing ${index + 1}/${transcripts.length}`;
+    const label = `Knowledge Profile: extracting evidence ${index + 1}/${transcripts.length}`;
     ctx.ui.setWorkingMessage(label);
     ctx.ui.setStatus("knowledge-profile", label);
     try {
