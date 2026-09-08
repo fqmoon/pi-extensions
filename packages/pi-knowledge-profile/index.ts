@@ -265,8 +265,8 @@ async function writeCandidate(candidate: Candidate, status: Status): Promise<voi
   await atomicWrite(path, content);
 }
 
-async function review(ctx: ExtensionCommandContext, candidates: Candidate[]): Promise<number> {
-  let accepted = 0;
+async function review(ctx: ExtensionCommandContext, candidates: Candidate[]): Promise<Array<{ candidate: Candidate; status: Status }>> {
+  const accepted: Array<{ candidate: Candidate; status: Status }> = [];
   for (const candidate of candidates) {
     const detail = [
       `${candidate.domain} / ${candidate.subdomain} / ${candidate.knowledgePoint}`,
@@ -279,8 +279,7 @@ async function review(ctx: ExtensionCommandContext, candidates: Candidate[]): Pr
     const choice = await ctx.ui.select("Knowledge Profile review", [...STATUSES, "保持原状态", "不记录"]);
     if (!choice) throw new Error("Review cancelled; no profile changes or checkpoints were written.");
     if (validStatus(choice)) {
-      await writeCandidate(candidate, choice);
-      accepted += 1;
+      accepted.push({ candidate, status: choice });
     }
   }
   return accepted;
@@ -308,9 +307,10 @@ async function sync(ctx: ExtensionCommandContext): Promise<void> {
     return;
   }
   const accepted = await review(ctx, candidates);
+  for (const item of accepted) await writeCandidate(item.candidate, item.status);
   const checkpoints = { ...state.checkpoints, ...Object.fromEntries(pending.map((item) => [item.path, item.lastEntryId])) };
   await atomicWrite(STATE_PATH, JSON.stringify({ ...state, checkpoints }, null, 2) + "\n");
-  ctx.ui.notify(`Knowledge Profile: reviewed ${candidates.length} candidates; recorded ${accepted}.`, "info");
+  ctx.ui.notify(`Knowledge Profile: reviewed ${candidates.length} candidates; recorded ${accepted.length}.`, "info");
 }
 
 export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
