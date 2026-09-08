@@ -27,6 +27,8 @@ Run /knowledge-sync to review updates.
 4. shows each candidate's context, evidence, and reason, then asks for a user decision;
 5. atomically writes accepted records to domain Markdown files and advances the checkpoint.
 
+Each successfully extracted session is immediately staged in `state.json`, without advancing its checkpoint. If a large first sync is stopped, run `/knowledge-review` to reconcile and review the already extracted sessions immediately. A successful review writes the profile, advances those session checkpoints, and clears the staged batch. Until that point, the staged evidence remains resumable and is not treated as confirmed knowledge.
+
 The command is the only path that runs analysis or changes the profile. Startup never opens a modal or calls a model.
 
 ## Storage
@@ -34,7 +36,7 @@ The command is the only path that runs analysis or changes the profile. Startup 
 The profile is stored under `~/.pi/agent/user-knowledge/`:
 
 ```text
-state.json                 # schedule and per-session incremental checkpoints
+state.json                 # schedule, staged evidence, and per-session checkpoints
 Graphics.md                # one Markdown file per domain
 Software engineering.md
 ```

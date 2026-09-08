@@ -17,11 +17,18 @@ const STATUSES = ["完全掌握", "重要部分掌握", "基本不懂", "完全�
 
 type Status = (typeof STATUSES)[number];
 type Checkpoint = Record<string, string>;
+type StagedSession = {
+  lastEntryId: string;
+  evidence: Evidence[];
+};
 type State = {
   version: 1;
   frequency: "daily" | "weekly";
   lastPromptAt?: string;
   checkpoints: Checkpoint;
+  // Evidence is staged until its candidates have been reviewed. This keeps an
+  // interrupted initial import resumable without treating it as confirmed.
+  staged: Record<string, StagedSession>;
 };
 type Transcript = {
   path: string;
@@ -55,7 +62,7 @@ type Candidate = {
 };
 
 function defaultState(): State {
-  return { version: 1, frequency: "weekly", checkpoints: {} };
+  return { version: 1, frequency: "weekly", checkpoints: {}, staged: {} };
 }
 
 async function loadState(): Promise<State> {
@@ -69,6 +76,15 @@ async function loadState(): Promise<State> {
         parsed.checkpoints && typeof parsed.checkpoints === "object"
           ? parsed.checkpoints as Checkpoint
           : {},
+      staged:
+        parsed.staged && typeof parsed.staged === "object"
+          ? Object.fromEntries(Object.entries(parsed.staged).flatMap(([path, item]) => {
+            if (typeof item !== "object" || item === null) return [];
+            const raw = item as Partial<StagedSession>;
+            if (typeof raw.lastEntryId !== "string" || !Array.isArray(raw.evidence)) return [];
+            return [[path, { lastEntryId: raw.lastEntryId, evidence: raw.evidence.filter(isEvidence) }]];
+          }))
+          : {},
     };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaultState();
@@ -81,6 +97,10 @@ async function atomicWrite(path: string, contents: string): Promise<void> {
   const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(temporary, contents, "utf8");
   await rename(temporary, path);
+}
+
+async function writeState(state: State): Promise<void> {
+  await atomicWrite(STATE_PATH, JSON.stringify(state, null, 2) + "\n");
 }
 
 function isDue(lastPromptAt: string | undefined, frequency: State["frequency"]): boolean {
@@ -127,7 +147,9 @@ async function collectPending(state: State): Promise<Transcript[]> {
   for (const session of sessions) {
     const manager = SessionManager.open(session.path);
     const branch = manager.getBranch();
-    const pending = pendingBranchEntries(branch, state.checkpoints[session.path]);
+    // A staged entry is newer than the confirmed checkpoint. Only extract
+    // additions after it; the prior evidence is already durable in state.json.
+    const pending = pendingBranchEntries(branch, state.staged[session.path]?.lastEntryId ?? state.checkpoints[session.path]);
     const messages = pending.map(messageText).filter((value): value is NonNullable<typeof value> => Boolean(value));
     const text = messages.map((message) => `## ${message.role}\n\n${message.text}`).join("\n\n").slice(0, MAX_SESSION_CHARS);
     const last = branch.at(-1);
@@ -196,6 +218,12 @@ function cleanEvidence(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 4);
 }
 
+function isEvidence(value: unknown): value is Evidence {
+  if (typeof value !== "object" || value === null) return false;
+  const raw = value as Partial<Evidence>;
+  return typeof raw.session === "string" && typeof raw.context === "string" && cleanEvidence(raw.evidence).length > 0;
+}
+
 function normalizeCandidates(value: unknown): Candidate[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((item): Candidate[] => {
@@ -220,7 +248,7 @@ const EXTRACTION_SYSTEM = `You extract conservative evidence about a user's demo
 
 const RECONCILIATION_SYSTEM = `You reconcile evidence into a user-reviewable knowledge profile. Return only a JSON array, with objects exactly {"domain":"...","subdomain":"...","knowledgePoint":"...","suggestedStatus":"完全掌握|重要部分掌握|基本不懂|完全不懂","context":"...","evidence":["concrete evidence"],"reason":"why this status, including why it is not a stronger neighbouring status"}. Be conservative. Do not create a broad point where evidence supports only a narrow one. A question alone is never evidence of not understanding. Include only candidates that need a user decision.`;
 
-async function extractEvidence(ctx: ExtensionCommandContext, transcripts: Transcript[]): Promise<ExtractionResult> {
+async function extractEvidence(ctx: ExtensionCommandContext, state: State, transcripts: Transcript[]): Promise<ExtractionResult> {
   const output: Evidence[] = [];
   const completed: Transcript[] = [];
   const failures: AnalysisFailure[] = [];
@@ -235,6 +263,14 @@ async function extractEvidence(ctx: ExtensionCommandContext, transcripts: Transc
       ).map((item) => ({ ...item, session: basename(transcript.path), evidence: cleanEvidence(item.evidence) }));
       output.push(...items);
       completed.push(transcript);
+      const staged = state.staged[transcript.path];
+      state.staged[transcript.path] = {
+        lastEntryId: transcript.lastEntryId,
+        evidence: [...(staged?.evidence ?? []), ...items],
+      };
+      // Persist each successful extraction. Stopping a long first run therefore
+      // leaves a reviewable batch instead of discarding its completed work.
+      await writeState(state);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       failures.push({ session: basename(transcript.path), reason });
@@ -301,37 +337,51 @@ async function review(ctx: ExtensionCommandContext, candidates: Candidate[]): Pr
   return accepted;
 }
 
+async function reviewStaged(ctx: ExtensionCommandContext, state: State): Promise<void> {
+  const staged = Object.entries(state.staged);
+  if (staged.length === 0) {
+    ctx.ui.notify("Knowledge Profile: no extracted sessions are waiting for review.", "info");
+    return;
+  }
+  const evidence = staged.flatMap(([, item]) => item.evidence);
+  const checkpoints = {
+    ...state.checkpoints,
+    ...Object.fromEntries(staged.map(([path, item]) => [path, item.lastEntryId])),
+  };
+  if (evidence.length === 0) {
+    await writeState({ ...state, checkpoints, staged: {} });
+    ctx.ui.notify(`Knowledge Profile: no sufficiently strong evidence found in ${staged.length} extracted sessions.`, "info");
+    return;
+  }
+  ctx.ui.setWorkingMessage("Knowledge Profile: reconciling cross-session evidence…");
+  ctx.ui.setStatus("knowledge-profile", "Knowledge Profile: reconciling evidence");
+  const candidates = await reconcile(ctx, await readProfile(), evidence);
+  if (candidates.length === 0) {
+    await writeState({ ...state, checkpoints, staged: {} });
+    ctx.ui.notify(`Knowledge Profile: no new candidate needs review; committed ${staged.length} extracted sessions.`, "info");
+    return;
+  }
+  ctx.ui.setWorkingMessage("Knowledge Profile: awaiting review…");
+  const accepted = await review(ctx, candidates);
+  for (const item of accepted) await writeCandidate(item.candidate, item.status);
+  await writeState({ ...state, checkpoints, staged: {} });
+  ctx.ui.notify(`Knowledge Profile: reviewed ${candidates.length} candidates; recorded ${accepted.length}; committed ${staged.length} extracted sessions.`, "info");
+}
+
 async function sync(ctx: ExtensionCommandContext): Promise<void> {
   const state = await loadState();
   const pending = await collectPending(state);
-  if (pending.length === 0) {
-    ctx.ui.notify("Knowledge Profile: no new conversation history to review.", "info");
-    return;
-  }
   ctx.ui.setWorkingVisible(true);
   ctx.ui.setWorkingMessage(`Knowledge Profile: preparing ${pending.length} sessions…`);
   ctx.ui.setStatus("knowledge-profile", `Knowledge Profile: preparing ${pending.length} sessions`);
   try {
-    const extraction = await extractEvidence(ctx, pending);
-    const checkpoints = { ...state.checkpoints, ...Object.fromEntries(extraction.completed.map((item) => [item.path, item.lastEntryId])) };
-    if (extraction.evidence.length === 0) {
-      if (extraction.completed.length > 0) await atomicWrite(STATE_PATH, JSON.stringify({ ...state, checkpoints }, null, 2) + "\n");
-      ctx.ui.notify(`Knowledge Profile: no sufficiently strong evidence found; processed ${extraction.completed.length}, skipped ${extraction.failures.length}.`, "info");
-      return;
+    if (pending.length > 0) {
+      const extraction = await extractEvidence(ctx, state, pending);
+      if (extraction.failures.length > 0) {
+        ctx.ui.notify(`Knowledge Profile: extracted ${extraction.completed.length}; skipped ${extraction.failures.length}. Extracted sessions are ready for /knowledge-review.`, "warning");
+      }
     }
-    ctx.ui.setWorkingMessage("Knowledge Profile: reconciling cross-session evidence…");
-    ctx.ui.setStatus("knowledge-profile", "Knowledge Profile: reconciling evidence");
-    const candidates = await reconcile(ctx, await readProfile(), extraction.evidence);
-    if (candidates.length === 0) {
-      await atomicWrite(STATE_PATH, JSON.stringify({ ...state, checkpoints }, null, 2) + "\n");
-      ctx.ui.notify(`Knowledge Profile: no new candidate needs review; processed ${extraction.completed.length}, skipped ${extraction.failures.length}.`, "info");
-      return;
-    }
-    ctx.ui.setWorkingMessage("Knowledge Profile: awaiting review…");
-    const accepted = await review(ctx, candidates);
-    for (const item of accepted) await writeCandidate(item.candidate, item.status);
-    await atomicWrite(STATE_PATH, JSON.stringify({ ...state, checkpoints }, null, 2) + "\n");
-    ctx.ui.notify(`Knowledge Profile: reviewed ${candidates.length} candidates; recorded ${accepted.length}; skipped ${extraction.failures.length}.`, "info");
+    await reviewStaged(ctx, state);
   } finally {
     ctx.ui.setStatus("knowledge-profile", undefined);
     ctx.ui.setWorkingMessage();
@@ -371,6 +421,23 @@ export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
         profile = await readProfile();
       } catch (error) {
         ctx.ui.notify(`Knowledge sync failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("knowledge-review", {
+    description: "Review evidence already extracted from sessions and update the knowledge profile",
+    handler: async (_args, ctx) => {
+      try {
+        ctx.ui.setWorkingVisible(true);
+        await reviewStaged(ctx, await loadState());
+        profile = await readProfile();
+      } catch (error) {
+        ctx.ui.notify(`Knowledge review failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      } finally {
+        ctx.ui.setStatus("knowledge-profile", undefined);
+        ctx.ui.setWorkingMessage();
+        ctx.ui.setWorkingVisible(false);
       }
     },
   });
