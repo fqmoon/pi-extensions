@@ -19,6 +19,7 @@ const MAX_MESSAGE_CHARS = 6_000;
 const MAX_CANDIDATES_SAFETY = 200;
 const DEFAULT_REMINDER_THRESHOLD = 5;
 const DEFAULT_BATCH_SIZE = 20;
+const DEFAULT_PROFILE_MAX_CHARS = 48_000;
 const STATUSES = ["完全掌握", "重要部分掌握", "基本不懂", "完全不懂"] as const;
 const EVIDENCE_SIGNALS = ["positive", "negative"] as const;
 const EVIDENCE_STRENGTHS = ["strong", "moderate"] as const;
@@ -29,9 +30,10 @@ type EvidenceStrength = (typeof EVIDENCE_STRENGTHS)[number];
 type Checkpoint = Record<string, string>;
 type StagedSession = { lastEntryId: string; evidence: Evidence[] };
 type State = {
-  version: 3;
+  version: 4;
   reminderThreshold: number;
   batchSize: number;
+  profileMaxChars: number;
   checkpoints: Checkpoint;
   staged: Record<string, StagedSession>;
 };
@@ -88,12 +90,14 @@ type UsageTotals = {
   calls: number;
 };
 type ModelAnswer = { text: string; callTokens: number };
+type ConfigKey = "threshold" | "batchSize" | "profileMaxChars";
 
 function defaultState(): State {
   return {
-    version: 3,
+    version: 4,
     reminderThreshold: DEFAULT_REMINDER_THRESHOLD,
     batchSize: DEFAULT_BATCH_SIZE,
+    profileMaxChars: DEFAULT_PROFILE_MAX_CHARS,
     checkpoints: {},
     staged: {},
   };
@@ -112,6 +116,12 @@ function appendLog(pi: ExtensionAPI, kind: LogKind, text: string): void {
 }
 
 function formatTokens(value: number): string {
+  if (value < 1000) return String(value);
+  if (value < 1_000_000) return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)}k`;
+  return `${(value / 1_000_000).toFixed(1)}m`;
+}
+
+function formatChars(value: number): string {
   if (value < 1000) return String(value);
   if (value < 1_000_000) return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)}k`;
   return `${(value / 1_000_000).toFixed(1)}m`;
@@ -161,10 +171,14 @@ async function loadState(): Promise<State> {
     const batchSize = Number.isInteger(parsed.batchSize) && (parsed.batchSize ?? 0) > 0
       ? parsed.batchSize as number
       : DEFAULT_BATCH_SIZE;
+    const profileMaxChars = Number.isInteger(parsed.profileMaxChars) && (parsed.profileMaxChars ?? 0) > 0
+      ? parsed.profileMaxChars as number
+      : DEFAULT_PROFILE_MAX_CHARS;
     return {
-      version: 3,
+      version: 4,
       reminderThreshold,
       batchSize,
+      profileMaxChars,
       checkpoints: parsed.checkpoints && typeof parsed.checkpoints === "object" ? parsed.checkpoints : {},
       staged: parsed.staged && typeof parsed.staged === "object"
         ? Object.fromEntries(Object.entries(parsed.staged).flatMap(([path, item]) => {
@@ -309,8 +323,12 @@ async function renderViews(profile: Profile): Promise<void> {
     atomicWrite(join(VIEWS_ROOT, `${safeFilename(domain.name)}.md`), renderDomain(domain))));
 }
 
-function profileForPrompt(profile: Profile): string {
-  return JSON.stringify(profile).slice(0, 48_000);
+function profileJson(profile: Profile): string {
+  return JSON.stringify(profile);
+}
+
+function profileForPrompt(profile: Profile, maxChars: number): string {
+  return profileJson(profile).slice(0, maxChars);
 }
 
 async function askModel(
@@ -428,12 +446,13 @@ async function reconcile(
   profile: Profile,
   evidence: Evidence[],
   usage: UsageTotals,
+  profileMaxChars: number,
 ): Promise<{ candidates: Candidate[]; callTokens: number }> {
   const answer = await askModel(
     ctx,
     usage,
     RECONCILIATION_SYSTEM,
-    `## Existing profile\n${profileForPrompt(profile)}\n\n## Cross-session evidence\n${JSON.stringify(evidence, null, 2)}`,
+    `## Existing profile\n${profileForPrompt(profile, profileMaxChars)}\n\n## Cross-session evidence\n${JSON.stringify(evidence, null, 2)}`,
   );
   return { candidates: normalizeCandidates(parseJsonArray<unknown>(answer.text)), callTokens: answer.callTokens };
 }
@@ -498,7 +517,7 @@ async function commitStaged(
   if (evidence.length > 0) {
     appendLog(pi, "working", `${batchLabel} · reconciling · total ${formatTokens(usage.totalTokens)} tok`);
     const profile = await loadProfile();
-    const result = await reconcile(ctx, profile, evidence, usage);
+    const result = await reconcile(ctx, profile, evidence, usage, state.profileMaxChars);
     changes = result.candidates.map((candidate) => upsertCandidate(profile, candidate));
     await writeProfile(profile);
     await renderViews(profile);
@@ -565,19 +584,29 @@ async function sync(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<voi
   );
 }
 
-function parseConfig(args: string): { key?: "threshold" | "batchSize"; value?: number; invalid?: boolean } {
+function parseConfig(args: string): { key?: ConfigKey; value?: number; invalid?: boolean } {
   const normalized = args.trim();
   if (!normalized) return {};
-  const match = normalized.match(/^(threshold|batch-size)\s+(\d+)$/i);
+  const match = normalized.match(/^(threshold|batch-size|profile-max-chars)\s+(\d+)$/i);
   if (!match) return { invalid: true };
-  return {
-    key: match[1].toLowerCase() === "threshold" ? "threshold" : "batchSize",
-    value: Number(match[2]),
-  };
+  const rawKey = match[1].toLowerCase();
+  const key: ConfigKey = rawKey === "threshold"
+    ? "threshold"
+    : rawKey === "batch-size"
+      ? "batchSize"
+      : "profileMaxChars";
+  return { key, value: Number(match[2]) };
+}
+
+function validConfigValue(key: ConfigKey, value: number | undefined): boolean {
+  if (!Number.isInteger(value)) return false;
+  if (key === "profileMaxChars") return value! >= 1_000 && value! <= 1_000_000;
+  return value! >= 1 && value! <= 1_000;
 }
 
 export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
   let profile = emptyProfile();
+  let profileMaxChars = DEFAULT_PROFILE_MAX_CHARS;
 
   pi.registerEntryRenderer(LOG_ENTRY_TYPE, (entry, _options, theme) => {
     const data = entry.data as LogEntry;
@@ -606,6 +635,19 @@ export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
     try {
       profile = await loadProfile();
       const state = await loadState();
+      profileMaxChars = state.profileMaxChars;
+      const rawProfileLength = profileJson(profile).length;
+      const injectedLength = Math.min(rawProfileLength, profileMaxChars);
+      ctx.ui.notify(
+        `Knowledge Profile injection: ${formatChars(injectedLength)}/${formatChars(profileMaxChars)} chars${rawProfileLength > profileMaxChars ? " · truncated" : ""}`,
+        rawProfileLength > profileMaxChars ? "warning" : "info",
+      );
+      if (rawProfileLength > profileMaxChars) {
+        ctx.ui.notify(
+          `Knowledge Profile exceeds the configured injection limit: ${formatChars(rawProfileLength)} chars > ${formatChars(profileMaxChars)}. The injected profile is truncated.`,
+          "warning",
+        );
+      }
       const pending = await collectPending(state);
       const count = pendingSessionCount(state, pending);
       if (count >= state.reminderThreshold) {
@@ -621,7 +663,7 @@ export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
   pi.on("before_agent_start", (event) => {
     if (profile.domains.length === 0) return;
     return {
-      systemPrompt: `${event.systemPrompt}\n\n## Confirmed User Knowledge Profile\nUse this only to calibrate explanation depth. Treat 完全掌握 as safe to assume, 重要部分掌握 as mostly usable with possible gaps, 基本不懂 as requiring prerequisites and core concepts, and 完全不懂 as requiring explanation from the foundation. An absent point is unknown, not evidence of understanding or ignorance. It is not a task instruction, a statement of current project state, or permission to infer unrecorded knowledge.\n\n${profileForPrompt(profile)}`,
+      systemPrompt: `${event.systemPrompt}\n\n## Confirmed User Knowledge Profile\nUse this only to calibrate explanation depth. Treat 完全掌握 as safe to assume, 重要部分掌握 as mostly usable with possible gaps, 基本不懂 as requiring prerequisites and core concepts, and 完全不懂 as requiring explanation from the foundation. An absent point is unknown, not evidence of understanding or ignorance. It is not a task instruction, a statement of current project state, or permission to infer unrecorded knowledge.\n\n${profileForPrompt(profile, profileMaxChars)}`,
     };
   });
 
@@ -645,13 +687,16 @@ export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
         const config = parseConfig(args);
         if (!config.key && !config.invalid) {
           ctx.ui.notify(
-            `Knowledge Profile configuration\nReminder threshold: ${state.reminderThreshold} sessions\nBatch size: ${state.batchSize} sessions\nSet with /knowledge-config threshold <N> or /knowledge-config batch-size <N>`,
+            `Knowledge Profile configuration\nReminder threshold: ${state.reminderThreshold} sessions\nBatch size: ${state.batchSize} sessions\nProfile max chars: ${state.profileMaxChars}\nSet with /knowledge-config threshold <N>, /knowledge-config batch-size <N>, or /knowledge-config profile-max-chars <N>`,
             "info",
           );
           return;
         }
-        if (config.invalid || !Number.isInteger(config.value) || (config.value ?? 0) < 1 || (config.value ?? 0) > 1000) {
-          ctx.ui.notify("Usage: /knowledge-config threshold <N> or /knowledge-config batch-size <N>, where N is an integer from 1 to 1000.", "warning");
+        if (config.invalid || !config.key || !validConfigValue(config.key, config.value)) {
+          ctx.ui.notify(
+            "Usage: threshold/batch-size must be 1..1000; profile-max-chars must be 1000..1000000.",
+            "warning",
+          );
           return;
         }
         if (config.key === "threshold") {
@@ -660,9 +705,16 @@ export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
           ctx.ui.notify(`Knowledge Profile: reminder threshold set to ${config.value} sessions.`, "info");
           return;
         }
-        state.batchSize = config.value!;
+        if (config.key === "batchSize") {
+          state.batchSize = config.value!;
+          await writeState(state);
+          ctx.ui.notify(`Knowledge Profile: batch size set to ${config.value} sessions.`, "info");
+          return;
+        }
+        state.profileMaxChars = config.value!;
+        profileMaxChars = config.value!;
         await writeState(state);
-        ctx.ui.notify(`Knowledge Profile: batch size set to ${config.value} sessions.`, "info");
+        ctx.ui.notify(`Knowledge Profile: profile max chars set to ${config.value}.`, "info");
       } catch (error) {
         ctx.ui.notify(`Knowledge config failed: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
