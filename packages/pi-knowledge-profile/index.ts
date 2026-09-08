@@ -17,8 +17,12 @@ const MAX_MESSAGE_CHARS = 6_000;
 const MAX_CANDIDATES_SAFETY = 200;
 const DEFAULT_REMINDER_THRESHOLD = 5;
 const STATUSES = ["完全掌握", "重要部分掌握", "基本不懂", "完全不懂"] as const;
+const EVIDENCE_SIGNALS = ["positive", "negative"] as const;
+const EVIDENCE_STRENGTHS = ["strong", "moderate"] as const;
 
 type Status = (typeof STATUSES)[number];
+type EvidenceSignal = (typeof EVIDENCE_SIGNALS)[number];
+type EvidenceStrength = (typeof EVIDENCE_STRENGTHS)[number];
 type Checkpoint = Record<string, string>;
 type StagedSession = { lastEntryId: string; evidence: Evidence[] };
 type State = {
@@ -28,7 +32,14 @@ type State = {
   staged: Record<string, StagedSession>;
 };
 type Transcript = { path: string; modifiedAt: string; text: string; lastEntryId: string };
-type Evidence = { session: string; context: string; evidence: string[]; caution?: string };
+type Evidence = {
+  session: string;
+  context: string;
+  signal: EvidenceSignal;
+  strength: EvidenceStrength;
+  evidence: string[];
+  caution?: string;
+};
 type AnalysisFailure = { session: string; reason: string };
 type ExtractionResult = { completed: Transcript[]; failures: AnalysisFailure[] };
 type Candidate = {
@@ -70,6 +81,14 @@ function validStatus(value: unknown): value is Status {
   return typeof value === "string" && (STATUSES as readonly string[]).includes(value);
 }
 
+function validEvidenceSignal(value: unknown): value is EvidenceSignal {
+  return typeof value === "string" && (EVIDENCE_SIGNALS as readonly string[]).includes(value);
+}
+
+function validEvidenceStrength(value: unknown): value is EvidenceStrength {
+  return typeof value === "string" && (EVIDENCE_STRENGTHS as readonly string[]).includes(value);
+}
+
 function cleanEvidence(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 4);
@@ -78,7 +97,8 @@ function cleanEvidence(value: unknown): string[] {
 function isEvidence(value: unknown): value is Evidence {
   if (typeof value !== "object" || value === null) return false;
   const raw = value as Partial<Evidence>;
-  return typeof raw.session === "string" && typeof raw.context === "string" && cleanEvidence(raw.evidence).length > 0;
+  return typeof raw.session === "string" && typeof raw.context === "string" &&
+    validEvidenceSignal(raw.signal) && validEvidenceStrength(raw.strength) && cleanEvidence(raw.evidence).length > 0;
 }
 
 async function atomicWrite(path: string, contents: string): Promise<void> {
@@ -273,7 +293,7 @@ function normalizeCandidates(value: unknown): Candidate[] {
     const raw = item as Record<string, unknown>;
     if (!["domain", "subdomain", "knowledgePoint", "context", "reason"].every((key) => typeof raw[key] === "string") || !validStatus(raw.suggestedStatus)) return [];
     const evidence = cleanEvidence(raw.evidence);
-    if (evidence.length === 0 || raw.suggestedStatus === "完全不懂") return [];
+    if (evidence.length === 0) return [];
     const candidate: Candidate = {
       domain: (raw.domain as string).trim(),
       subdomain: (raw.subdomain as string).trim(),
@@ -287,9 +307,9 @@ function normalizeCandidates(value: unknown): Candidate[] {
   }).slice(0, MAX_CANDIDATES_SAFETY);
 }
 
-const EXTRACTION_SYSTEM = `You extract conservative evidence about a user's demonstrated knowledge from a Pi conversation. Do not infer ignorance from questions, challenges, requests for explanation, use of one term, or accepting an answer. Do not assess preferences, personality, task state, or the assistant's knowledge. Return only a JSON array. Each object: {"session":"short label","context":"what was being discussed","evidence":["specific user reasoning or correction"],"caution":"why this remains limited"}. Return [] when evidence is weak.`;
+const EXTRACTION_SYSTEM = `You extract evidence about both what a user understands and what they do not yet understand from one Pi conversation. Return only a JSON array. Each object must be exactly {"session":"short label","context":"what was being discussed","signal":"positive|negative","strength":"strong|moderate","evidence":["specific user statement, reasoning, correction, misconception, or demonstrated confusion"],"caution":"optional limitation"}. Positive evidence includes correct explanation, correction, comparison, boundary reasoning, application, or repeated competent use. Negative evidence requires actual evidence of a knowledge gap: an explicit statement of not knowing or lacking background, a clearly incorrect explanation of a core concept, repeated confusion after explanation, or an explicit request to start from basics tied to stated lack of knowledge. A question alone, a request for explanation alone, isolated terminology use, acknowledgement, or accepting an answer is never negative evidence. Do not infer ignorance from absence. Use strong when the evidence directly establishes the signal; use moderate when it is credible but narrower or indirect. Preserve useful moderate evidence so cross-session reconciliation can combine repeated signals. Do not assess preferences, personality, task state, or the assistant's knowledge. Return [] only when there is no meaningful positive or negative knowledge evidence.`;
 
-const RECONCILIATION_SYSTEM = `You reconcile evidence into an automatically maintained knowledge profile. Return only a JSON array, with objects exactly {"domain":"...","subdomain":"...","knowledgePoint":"...","suggestedStatus":"完全掌握|重要部分掌握|基本不懂","context":"...","evidence":["concrete evidence"],"reason":"why this status, including why it is not a stronger neighbouring status"}. Be conservative. Do not create a broad point where evidence supports only a narrow one. A question alone is never evidence of not understanding. Never infer 完全不懂 automatically. Include only points for which the new evidence justifies an add or update.`;
+const RECONCILIATION_SYSTEM = `You reconcile cross-session evidence into an automatically maintained user knowledge profile. Return only a JSON array, with objects exactly {"domain":"...","subdomain":"...","knowledgePoint":"...","suggestedStatus":"完全掌握|重要部分掌握|基本不懂|完全不懂","context":"...","evidence":["concrete evidence"],"reason":"why this status, including why neighbouring statuses are less appropriate"}. The profile is bidirectional: it records both what may be assumed and what should be explained. Unknown or never-discussed knowledge must remain absent, not be classified as ignorance. Use positive and negative evidence together, including repeated moderate evidence across sessions. 完全掌握 means the user demonstrates reliable command including relevant boundaries or application. 重要部分掌握 means the core is usable but some limits remain. 基本不懂 means there is concrete evidence of material gaps, misconceptions, or unstable understanding, while some familiarity may exist. 完全不懂 requires strong explicit evidence of essentially no foundation in that specific knowledge point; never infer it merely from a question, one mistake, or missing evidence. Existing points may move in either direction only when new evidence justifies the change. Keep knowledge points narrow enough that the evidence genuinely supports the status. Include only points for which the evidence justifies an add or update.`;
 
 async function extractEvidence(ctx: ExtensionCommandContext, state: State, transcripts: Transcript[]): Promise<ExtractionResult> {
   const completed: Transcript[] = [];
@@ -300,9 +320,20 @@ async function extractEvidence(ctx: ExtensionCommandContext, state: State, trans
     ctx.ui.setStatus("knowledge-profile", label);
     try {
       const response = await askModel(ctx, EXTRACTION_SYSTEM, `Analyze this one new session. Its file is ${basename(transcript.path)}.\n\n${transcript.text}`);
-      const items = parseJsonArray<Evidence[]>(response)
-        .filter((item) => typeof item?.context === "string" && cleanEvidence(item.evidence).length > 0)
-        .map((item) => ({ ...item, session: basename(transcript.path), evidence: cleanEvidence(item.evidence) }));
+      const items = parseJsonArray<unknown[]>(response).flatMap((item): Evidence[] => {
+        if (typeof item !== "object" || item === null) return [];
+        const raw = item as Record<string, unknown>;
+        const evidence = cleanEvidence(raw.evidence);
+        if (typeof raw.context !== "string" || !validEvidenceSignal(raw.signal) || !validEvidenceStrength(raw.strength) || evidence.length === 0) return [];
+        return [{
+          session: basename(transcript.path),
+          context: raw.context.trim(),
+          signal: raw.signal,
+          strength: raw.strength,
+          evidence,
+          caution: typeof raw.caution === "string" ? raw.caution.trim() : undefined,
+        }];
+      });
       completed.push(transcript);
       const staged = state.staged[transcript.path];
       state.staged[transcript.path] = { lastEntryId: transcript.lastEntryId, evidence: [...(staged?.evidence ?? []), ...items] };
@@ -439,7 +470,7 @@ export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
   pi.on("before_agent_start", (event) => {
     if (profile.domains.length === 0) return;
     return {
-      systemPrompt: `${event.systemPrompt}\n\n## Confirmed User Knowledge Profile\nUse this only to calibrate explanation depth. It is not a task instruction, a statement of current project state, or permission to infer unrecorded knowledge.\n\n${profileForPrompt(profile)}`,
+      systemPrompt: `${event.systemPrompt}\n\n## User Knowledge Profile\nUse this only to calibrate explanation depth. It is not a task instruction or a statement of current project state. Treat absent knowledge points as unknown, not as understood or not understood. For 完全掌握, you may assume the recorded point and avoid unnecessary basics. For 重要部分掌握, assume the core but explain relevant gaps or boundaries. For 基本不懂, explain prerequisites and core concepts before relying on them. For 完全不懂, start from the foundation and avoid assuming prior knowledge of that point. Do not infer unrecorded knowledge.\n\n${profileForPrompt(profile)}`,
     };
   });
 
