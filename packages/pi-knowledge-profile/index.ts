@@ -35,6 +35,15 @@ type Evidence = {
   evidence: string[];
   caution?: string;
 };
+type AnalysisFailure = {
+  session: string;
+  reason: string;
+};
+type ExtractionResult = {
+  evidence: Evidence[];
+  completed: Transcript[];
+  failures: AnalysisFailure[];
+};
 type Candidate = {
   domain: string;
   subdomain: string;
@@ -211,21 +220,28 @@ const EXTRACTION_SYSTEM = `You extract conservative evidence about a user's demo
 
 const RECONCILIATION_SYSTEM = `You reconcile evidence into a user-reviewable knowledge profile. Return only a JSON array, with objects exactly {"domain":"...","subdomain":"...","knowledgePoint":"...","suggestedStatus":"完全掌握|重要部分掌握|基本不懂|完全不懂","context":"...","evidence":["concrete evidence"],"reason":"why this status, including why it is not a stronger neighbouring status"}. Be conservative. Do not create a broad point where evidence supports only a narrow one. A question alone is never evidence of not understanding. Include only candidates that need a user decision.`;
 
-async function extractEvidence(ctx: ExtensionContext, transcripts: Transcript[]): Promise<Evidence[]> {
+async function extractEvidence(ctx: ExtensionCommandContext, transcripts: Transcript[]): Promise<ExtractionResult> {
   const output: Evidence[] = [];
-  for (const transcript of transcripts) {
-    const response = await askModel(ctx, EXTRACTION_SYSTEM, `Analyze this one new session. Its file is ${basename(transcript.path)}.\n\n${transcript.text}`);
+  const completed: Transcript[] = [];
+  const failures: AnalysisFailure[] = [];
+  for (const [index, transcript] of transcripts.entries()) {
+    const label = `Knowledge Profile: analyzing ${index + 1}/${transcripts.length}`;
+    ctx.ui.setWorkingMessage(label);
+    ctx.ui.setStatus("knowledge-profile", label);
     try {
+      const response = await askModel(ctx, EXTRACTION_SYSTEM, `Analyze this one new session. Its file is ${basename(transcript.path)}.\n\n${transcript.text}`);
       const items = parseJson<Evidence[]>(response).filter((item) =>
         typeof item?.context === "string" && cleanEvidence(item.evidence).length > 0,
       ).map((item) => ({ ...item, session: basename(transcript.path), evidence: cleanEvidence(item.evidence) }));
       output.push(...items);
-    } catch {
-      // One malformed model answer must not discard other sessions or advance the checkpoint.
-      throw new Error(`Could not parse evidence for ${basename(transcript.path)}. Please run /knowledge-sync again.`);
+      completed.push(transcript);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      failures.push({ session: basename(transcript.path), reason });
+      ctx.ui.notify(`Knowledge Profile: skipped ${basename(transcript.path)} — ${reason}`, "warning");
     }
   }
-  return output;
+  return { evidence: output, completed, failures };
 }
 
 async function reconcile(ctx: ExtensionContext, profile: string, evidence: Evidence[]): Promise<Candidate[]> {
@@ -292,25 +308,35 @@ async function sync(ctx: ExtensionCommandContext): Promise<void> {
     ctx.ui.notify("Knowledge Profile: no new conversation history to review.", "info");
     return;
   }
-  ctx.ui.notify(`Knowledge Profile: analyzing ${pending.length} sessions (~${estimateTokens(pending).toLocaleString()} tokens).`, "info");
-  const evidence = await extractEvidence(ctx, pending);
-  if (evidence.length === 0) {
-    await atomicWrite(STATE_PATH, JSON.stringify({ ...state, checkpoints: { ...state.checkpoints, ...Object.fromEntries(pending.map((item) => [item.path, item.lastEntryId])) } }, null, 2) + "\n");
-    ctx.ui.notify("Knowledge Profile: no sufficiently strong evidence found; checkpoint updated.", "info");
-    return;
-  }
-  const candidates = await reconcile(ctx, await readProfile(), evidence);
-  if (candidates.length === 0) {
-    const checkpoints = { ...state.checkpoints, ...Object.fromEntries(pending.map((item) => [item.path, item.lastEntryId])) };
+  ctx.ui.setWorkingVisible(true);
+  ctx.ui.setWorkingMessage(`Knowledge Profile: preparing ${pending.length} sessions…`);
+  ctx.ui.setStatus("knowledge-profile", `Knowledge Profile: preparing ${pending.length} sessions`);
+  try {
+    const extraction = await extractEvidence(ctx, pending);
+    const checkpoints = { ...state.checkpoints, ...Object.fromEntries(extraction.completed.map((item) => [item.path, item.lastEntryId])) };
+    if (extraction.evidence.length === 0) {
+      if (extraction.completed.length > 0) await atomicWrite(STATE_PATH, JSON.stringify({ ...state, checkpoints }, null, 2) + "\n");
+      ctx.ui.notify(`Knowledge Profile: no sufficiently strong evidence found; processed ${extraction.completed.length}, skipped ${extraction.failures.length}.`, "info");
+      return;
+    }
+    ctx.ui.setWorkingMessage("Knowledge Profile: reconciling cross-session evidence…");
+    ctx.ui.setStatus("knowledge-profile", "Knowledge Profile: reconciling evidence");
+    const candidates = await reconcile(ctx, await readProfile(), extraction.evidence);
+    if (candidates.length === 0) {
+      await atomicWrite(STATE_PATH, JSON.stringify({ ...state, checkpoints }, null, 2) + "\n");
+      ctx.ui.notify(`Knowledge Profile: no new candidate needs review; processed ${extraction.completed.length}, skipped ${extraction.failures.length}.`, "info");
+      return;
+    }
+    ctx.ui.setWorkingMessage("Knowledge Profile: awaiting review…");
+    const accepted = await review(ctx, candidates);
+    for (const item of accepted) await writeCandidate(item.candidate, item.status);
     await atomicWrite(STATE_PATH, JSON.stringify({ ...state, checkpoints }, null, 2) + "\n");
-    ctx.ui.notify("Knowledge Profile: no new candidate needs review; checkpoint updated.", "info");
-    return;
+    ctx.ui.notify(`Knowledge Profile: reviewed ${candidates.length} candidates; recorded ${accepted.length}; skipped ${extraction.failures.length}.`, "info");
+  } finally {
+    ctx.ui.setStatus("knowledge-profile", undefined);
+    ctx.ui.setWorkingMessage();
+    ctx.ui.setWorkingVisible(false);
   }
-  const accepted = await review(ctx, candidates);
-  for (const item of accepted) await writeCandidate(item.candidate, item.status);
-  const checkpoints = { ...state.checkpoints, ...Object.fromEntries(pending.map((item) => [item.path, item.lastEntryId])) };
-  await atomicWrite(STATE_PATH, JSON.stringify({ ...state, checkpoints }, null, 2) + "\n");
-  ctx.ui.notify(`Knowledge Profile: reviewed ${candidates.length} candidates; recorded ${accepted.length}.`, "info");
 }
 
 export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
