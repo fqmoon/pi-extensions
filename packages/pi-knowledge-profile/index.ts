@@ -4,6 +4,7 @@ import {
   type ExtensionCommandContext,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { StringEnum, Type, type Tool, validateToolCall } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -20,6 +21,7 @@ const MAX_CANDIDATES_SAFETY = 200;
 const DEFAULT_REMINDER_THRESHOLD = 5;
 const DEFAULT_BATCH_SIZE = 20;
 const DEFAULT_PROFILE_MAX_CHARS = 48_000;
+const STRUCTURED_ATTEMPTS = 3;
 const STATUSES = ["完全掌握", "重要部分掌握", "基本不懂", "完全不懂"] as const;
 const EVIDENCE_SIGNALS = ["positive", "negative"] as const;
 const EVIDENCE_STRENGTHS = ["strong", "moderate"] as const;
@@ -74,11 +76,7 @@ type ProfileChange = {
   previousStatus?: Status;
   status: Status;
 };
-type BatchCommitResult = {
-  committed: number;
-  failures: number;
-  changes: ProfileChange[];
-};
+type BatchCommitResult = { committed: number; failures: number; changes: ProfileChange[] };
 type LogKind = "working" | "success" | "warning" | "info" | "error";
 type LogEntry = { kind: LogKind; text: string };
 type UsageTotals = {
@@ -89,8 +87,50 @@ type UsageTotals = {
   totalTokens: number;
   calls: number;
 };
-type ModelAnswer = { text: string; callTokens: number };
 type ConfigKey = "threshold" | "batchSize" | "profileMaxChars";
+type StructuredResult<T> = { value: T; callTokens: number; attempts: number };
+
+type RawEvidenceItem = {
+  context: string;
+  signal: EvidenceSignal;
+  strength: EvidenceStrength;
+  evidence: string[];
+  caution: string | null;
+};
+type EvidenceSubmission = { items: RawEvidenceItem[] };
+type CandidateSubmission = { items: Candidate[] };
+
+const evidenceItemSchema = Type.Object({
+  context: Type.String(),
+  signal: StringEnum([...EVIDENCE_SIGNALS]),
+  strength: StringEnum([...EVIDENCE_STRENGTHS]),
+  evidence: Type.Array(Type.String()),
+  caution: Type.Union([Type.String(), Type.Null()]),
+}, { additionalProperties: false });
+
+const candidateItemSchema = Type.Object({
+  domain: Type.String(),
+  subdomain: Type.String(),
+  knowledgePoint: Type.String(),
+  suggestedStatus: StringEnum([...STATUSES]),
+  context: Type.String(),
+  evidence: Type.Array(Type.String()),
+  reason: Type.String(),
+}, { additionalProperties: false });
+
+const EVIDENCE_TOOL: Tool = {
+  name: "submit_knowledge_evidence",
+  description: "Submit all knowledge evidence extracted from the session. Always call this tool exactly once, including when items is empty.",
+  parameters: Type.Object({ items: Type.Array(evidenceItemSchema) }, { additionalProperties: false }),
+  constrainedSampling: { type: "json_schema", strict: "require" },
+};
+
+const CANDIDATE_TOOL: Tool = {
+  name: "submit_knowledge_candidates",
+  description: "Submit all profile candidates justified by the supplied evidence. Always call this tool exactly once, including when items is empty.",
+  parameters: Type.Object({ items: Type.Array(candidateItemSchema) }, { additionalProperties: false }),
+  constrainedSampling: { type: "json_schema", strict: "require" },
+};
 
 function defaultState(): State {
   return {
@@ -115,16 +155,23 @@ function appendLog(pi: ExtensionAPI, kind: LogKind, text: string): void {
   pi.appendEntry(LOG_ENTRY_TYPE, { kind, text } satisfies LogEntry);
 }
 
-function formatTokens(value: number): string {
+function formatCompact(value: number): string {
   if (value < 1000) return String(value);
   if (value < 1_000_000) return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)}k`;
   return `${(value / 1_000_000).toFixed(1)}m`;
 }
 
-function formatChars(value: number): string {
-  if (value < 1000) return String(value);
-  if (value < 1_000_000) return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)}k`;
-  return `${(value / 1_000_000).toFixed(1)}m`;
+const formatTokens = formatCompact;
+const formatChars = formatCompact;
+
+function shortError(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error);
+  return text.replace(/\s+/g, " ").trim().slice(0, 240) || "unknown error";
+}
+
+function isNonRetryableStructuredError(error: unknown): boolean {
+  const text = shortError(error).toLowerCase();
+  return text.includes("does not support") && (text.includes("strict") || text.includes("constrained"));
 }
 
 function validStatus(value: unknown): value is Status {
@@ -331,59 +378,110 @@ function profileForPrompt(profile: Profile, maxChars: number): string {
   return profileJson(profile).slice(0, maxChars);
 }
 
-async function askModel(
-  ctx: ExtensionContext,
-  usage: UsageTotals,
-  systemPrompt: string,
-  prompt: string,
-): Promise<ModelAnswer> {
-  if (!ctx.model) throw new Error("No Pi model is selected. Select a model, then run /knowledge-sync again.");
-  const answer = await ctx.modelRegistry.complete(ctx.model, {
-    systemPrompt,
-    messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
-  }, { reasoning: ctx.thinkingLevel });
-  const callTokens = answer.usage.totalTokens || 0;
+function updateUsage(usage: UsageTotals, answer: { usage: Partial<UsageTotals> }): void {
   usage.input += answer.usage.input || 0;
   usage.output += answer.usage.output || 0;
   usage.cacheRead += answer.usage.cacheRead || 0;
   usage.cacheWrite += answer.usage.cacheWrite || 0;
-  usage.totalTokens += callTokens;
+  usage.totalTokens += answer.usage.totalTokens || 0;
   usage.calls += 1;
-  return { text: textContent(answer.content), callTokens };
 }
 
-function parseJsonArray<T>(text: string): T {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1] ?? text;
-  const start = fenced.indexOf("[");
-  const end = fenced.lastIndexOf("]");
-  if (start < 0 || end < start) throw new Error("The analysis model did not return a JSON array.");
-  return JSON.parse(fenced.slice(start, end + 1)) as T;
+async function askStructured<T>(
+  ctx: ExtensionContext,
+  usage: UsageTotals,
+  tool: Tool,
+  systemPrompt: string,
+  prompt: string,
+): Promise<T> {
+  if (!ctx.model) throw new Error("No Pi model is selected. Select a model, then run /knowledge-sync again.");
+  const answer = await ctx.modelRegistry.complete(ctx.model, {
+    systemPrompt,
+    messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
+    tools: [tool],
+  }, { reasoning: ctx.thinkingLevel });
+  updateUsage(usage, answer);
+
+  const calls = Array.isArray(answer.content)
+    ? answer.content.filter((item): item is Extract<(typeof answer.content)[number], { type: "toolCall" }> =>
+      typeof item === "object" && item !== null && item.type === "toolCall" && item.name === tool.name)
+    : [];
+  if (calls.length !== 1) {
+    const text = textContent(answer.content);
+    throw new Error(calls.length === 0
+      ? `Expected one ${tool.name} tool call, received none${text ? `; text: ${text.slice(0, 160)}` : ""}.`
+      : `Expected one ${tool.name} tool call, received ${calls.length}.`);
+  }
+  return validateToolCall([tool], calls[0]) as T;
 }
 
-function normalizeCandidates(value: unknown): Candidate[] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((item): Candidate[] => {
-    if (typeof item !== "object" || item === null) return [];
-    const raw = item as Record<string, unknown>;
-    if (!["domain", "subdomain", "knowledgePoint", "context", "reason"].every((key) => typeof raw[key] === "string") || !validStatus(raw.suggestedStatus)) return [];
+async function structuredWithRetries<T>(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  usage: UsageTotals,
+  label: string,
+  tool: Tool,
+  systemPrompt: string,
+  prompt: string,
+): Promise<StructuredResult<T>> {
+  const beforeTokens = usage.totalTokens;
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= STRUCTURED_ATTEMPTS; attempt += 1) {
+    try {
+      const value = await askStructured<T>(ctx, usage, tool, systemPrompt, prompt);
+      return { value, callTokens: usage.totalTokens - beforeTokens, attempts: attempt };
+    } catch (error) {
+      lastError = error;
+      const reason = shortError(error);
+      if (isNonRetryableStructuredError(error)) {
+        throw new Error(`${label} failed: ${reason}`);
+      }
+      if (attempt < STRUCTURED_ATTEMPTS) {
+        appendLog(pi, "warning", `${label} · attempt ${attempt}/${STRUCTURED_ATTEMPTS} failed · ${reason}`);
+        appendLog(pi, "working", `${label} · retry ${attempt + 1}/${STRUCTURED_ATTEMPTS}`);
+      }
+    }
+  }
+  throw new Error(`${label} failed after ${STRUCTURED_ATTEMPTS} attempts: ${shortError(lastError)}`);
+}
+
+function normalizeEvidenceSubmission(value: EvidenceSubmission, session: string): Evidence[] {
+  return value.items.flatMap((raw): Evidence[] => {
     const evidence = cleanEvidence(raw.evidence);
-    if (evidence.length === 0) return [];
-    const candidate: Candidate = {
-      domain: (raw.domain as string).trim(),
-      subdomain: (raw.subdomain as string).trim(),
-      knowledgePoint: (raw.knowledgePoint as string).trim(),
-      suggestedStatus: raw.suggestedStatus,
-      context: (raw.context as string).trim(),
+    const context = raw.context.trim();
+    if (!context || evidence.length === 0) return [];
+    const item: Evidence = {
+      session,
+      context,
+      signal: raw.signal,
+      strength: raw.strength,
       evidence,
-      reason: (raw.reason as string).trim(),
     };
-    return candidate.domain && candidate.subdomain && candidate.knowledgePoint && candidate.context && candidate.reason ? [candidate] : [];
+    if (raw.caution?.trim()) item.caution = raw.caution.trim();
+    return [item];
+  });
+}
+
+function normalizeCandidates(value: CandidateSubmission): Candidate[] {
+  return value.items.flatMap((raw): Candidate[] => {
+    const evidence = cleanEvidence(raw.evidence);
+    const candidate: Candidate = {
+      domain: raw.domain.trim(),
+      subdomain: raw.subdomain.trim(),
+      knowledgePoint: raw.knowledgePoint.trim(),
+      suggestedStatus: raw.suggestedStatus,
+      context: raw.context.trim(),
+      evidence,
+      reason: raw.reason.trim(),
+    };
+    return candidate.domain && candidate.subdomain && candidate.knowledgePoint && candidate.context &&
+      candidate.reason && evidence.length > 0 ? [candidate] : [];
   }).slice(0, MAX_CANDIDATES_SAFETY);
 }
 
-const EXTRACTION_SYSTEM = `You extract evidence about both what a user understands and what they do not yet understand from one Pi conversation. Return only a JSON array. Each object must be exactly {"session":"short label","context":"what was being discussed","signal":"positive|negative","strength":"strong|moderate","evidence":["specific user statement, reasoning, correction, misconception, or demonstrated confusion"],"caution":"optional limitation"}. Positive evidence includes correct explanation, correction, comparison, boundary reasoning, application, or repeated competent use. Negative evidence requires actual evidence of a knowledge gap: an explicit statement of not knowing or lacking background, a clearly incorrect explanation of a core concept, repeated confusion after explanation, or an explicit request to start from basics tied to stated lack of knowledge. A question alone, a request for explanation alone, isolated terminology use, acknowledgement, or accepting an answer is never negative evidence. Do not infer ignorance from absence. Use strong when the evidence directly establishes the signal; use moderate when it is credible but narrower or indirect. Preserve useful moderate evidence so cross-session reconciliation can combine repeated signals. Do not assess preferences, personality, task state, or the assistant's knowledge. Return [] only when there is no meaningful positive or negative knowledge evidence.`;
+const EXTRACTION_SYSTEM = `You extract evidence about both what a user understands and what they do not yet understand from one Pi conversation. You must finish by calling submit_knowledge_evidence exactly once. Do not return the result as text. Call the tool with items=[] when there is no meaningful evidence. Positive evidence includes correct explanation, correction, comparison, boundary reasoning, application, or repeated competent use. Negative evidence requires actual evidence of a knowledge gap: an explicit statement of not knowing or lacking background, a clearly incorrect explanation of a core concept, repeated confusion after explanation, or an explicit request to start from basics tied to stated lack of knowledge. A question alone, a request for explanation alone, isolated terminology use, acknowledgement, or accepting an answer is never negative evidence. Do not infer ignorance from absence. Use strong when the evidence directly establishes the signal; use moderate when it is credible but narrower or indirect. Preserve useful moderate evidence so cross-session reconciliation can combine repeated signals. Do not assess preferences, personality, task state, or the assistant's knowledge.`;
 
-const RECONCILIATION_SYSTEM = `You reconcile cross-session evidence into an automatically maintained user knowledge profile. Return only a JSON array, with objects exactly {"domain":"...","subdomain":"...","knowledgePoint":"...","suggestedStatus":"完全掌握|重要部分掌握|基本不懂|完全不懂","context":"...","evidence":["concrete evidence"],"reason":"why this status, including why neighbouring statuses are less appropriate"}. The profile is bidirectional: it records both what may be assumed and what should be explained. Unknown or never-discussed knowledge must remain absent, not be classified as ignorance. Use positive and negative evidence together, including repeated moderate evidence across sessions. 完全掌握 means the user demonstrates reliable command including relevant boundaries or application. 重要部分掌握 means the core is usable but some limits remain. 基本不懂 means there is concrete evidence of material gaps, misconceptions, or unstable understanding, while some familiarity may exist. 完全不懂 requires strong explicit evidence of essentially no foundation in that specific knowledge point; never infer it merely from a question, one mistake, or missing evidence. Existing points may move in either direction only when new evidence justifies the change. Keep knowledge points narrow enough that the evidence genuinely supports the status. Include only points for which the evidence justifies an add or update.`;
+const RECONCILIATION_SYSTEM = `You reconcile cross-session evidence into an automatically maintained user knowledge profile. You must finish by calling submit_knowledge_candidates exactly once. Do not return the result as text. Call the tool with items=[] when no profile add or update is justified. The profile is bidirectional: it records both what may be assumed and what should be explained. Unknown or never-discussed knowledge must remain absent, not be classified as ignorance. Use positive and negative evidence together, including repeated moderate evidence across sessions. 完全掌握 means the user demonstrates reliable command including relevant boundaries or application. 重要部分掌握 means the core is usable but some limits remain. 基本不懂 means there is concrete evidence of material gaps, misconceptions, or unstable understanding, while some familiarity may exist. 完全不懂 requires strong explicit evidence of essentially no foundation in that specific knowledge point; never infer it merely from a question, one mistake, or missing evidence. Existing points may move in either direction only when new evidence justifies the change. Keep knowledge points narrow enough that the evidence genuinely supports the status. Include only points for which the evidence justifies an add or update.`;
 
 async function extractEvidence(
   pi: ExtensionAPI,
@@ -398,28 +496,19 @@ async function extractEvidence(
   const failures: AnalysisFailure[] = [];
   for (const [index, transcript] of transcripts.entries()) {
     const position = offset + index + 1;
+    const session = basename(transcript.path);
+    const label = `${position}/${total} ${session}`;
     try {
-      const answer = await askModel(
+      const result = await structuredWithRetries<EvidenceSubmission>(
+        pi,
         ctx,
         usage,
+        label,
+        EVIDENCE_TOOL,
         EXTRACTION_SYSTEM,
-        `Analyze this one new session. Its file is ${basename(transcript.path)}.\n\n${transcript.text}`,
+        `Analyze this one new session. Its file is ${session}.\n\n${transcript.text}`,
       );
-      const items = parseJsonArray<unknown[]>(answer.text).flatMap((item): Evidence[] => {
-        if (typeof item !== "object" || item === null) return [];
-        const raw = item as Record<string, unknown>;
-        const evidence = cleanEvidence(raw.evidence);
-        if (typeof raw.context !== "string" || !validEvidenceSignal(raw.signal) || !validEvidenceStrength(raw.strength) || evidence.length === 0) return [];
-        const result: Evidence = {
-          session: basename(transcript.path),
-          context: raw.context.trim(),
-          signal: raw.signal,
-          strength: raw.strength,
-          evidence,
-        };
-        if (typeof raw.caution === "string" && raw.caution.trim()) result.caution = raw.caution.trim();
-        return result.context ? [result] : [];
-      });
+      const items = normalizeEvidenceSubmission(result.value, session);
       completed.push(transcript);
       const staged = state.staged[transcript.path];
       state.staged[transcript.path] = {
@@ -430,31 +519,36 @@ async function extractEvidence(
       appendLog(
         pi,
         "success",
-        `${position}/${total} ${basename(transcript.path)} · evidence ${items.length} · ${formatTokens(answer.callTokens)} tok · total ${formatTokens(usage.totalTokens)}`,
+        `${label} · evidence ${items.length} · ${formatTokens(result.callTokens)} tok · attempts ${result.attempts} · total ${formatTokens(usage.totalTokens)}`,
       );
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      failures.push({ session: basename(transcript.path), reason });
-      appendLog(pi, "warning", `${position}/${total} ${basename(transcript.path)} · skipped · ${reason}`);
+      const reason = shortError(error);
+      failures.push({ session, reason });
+      appendLog(pi, "warning", `${label} · skipped · ${reason}`);
     }
   }
   return { completed, failures };
 }
 
 async function reconcile(
+  pi: ExtensionAPI,
   ctx: ExtensionContext,
   profile: Profile,
   evidence: Evidence[],
   usage: UsageTotals,
   profileMaxChars: number,
-): Promise<{ candidates: Candidate[]; callTokens: number }> {
-  const answer = await askModel(
+  batchLabel: string,
+): Promise<StructuredResult<Candidate[]>> {
+  const result = await structuredWithRetries<CandidateSubmission>(
+    pi,
     ctx,
     usage,
+    `${batchLabel} reconcile`,
+    CANDIDATE_TOOL,
     RECONCILIATION_SYSTEM,
     `## Existing profile\n${profileForPrompt(profile, profileMaxChars)}\n\n## Cross-session evidence\n${JSON.stringify(evidence, null, 2)}`,
   );
-  return { candidates: normalizeCandidates(parseJsonArray<unknown>(answer.text)), callTokens: answer.callTokens };
+  return { ...result, value: normalizeCandidates(result.value) };
 }
 
 function upsertCandidate(profile: Profile, candidate: Candidate): ProfileChange {
@@ -517,10 +611,11 @@ async function commitStaged(
   if (evidence.length > 0) {
     appendLog(pi, "working", `${batchLabel} · reconciling · total ${formatTokens(usage.totalTokens)} tok`);
     const profile = await loadProfile();
-    const result = await reconcile(ctx, profile, evidence, usage, state.profileMaxChars);
-    changes = result.candidates.map((candidate) => upsertCandidate(profile, candidate));
+    const result = await reconcile(pi, ctx, profile, evidence, usage, state.profileMaxChars, batchLabel);
+    changes = result.value.map((candidate) => upsertCandidate(profile, candidate));
     await writeProfile(profile);
     await renderViews(profile);
+    appendLog(pi, "info", `${batchLabel} · reconcile attempts ${result.attempts} · ${formatTokens(result.callTokens)} tok`);
   }
 
   state.checkpoints = checkpoints;
@@ -543,7 +638,7 @@ async function sync(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<voi
 
   if (!ctx.model) throw new Error("No Pi model is selected. Select a model, then run /knowledge-sync again.");
   const modelLabel = `${ctx.model.provider}/${ctx.model.id}`;
-  appendLog(pi, "working", `Sync ${total} sessions · batch ${state.batchSize} · ${modelLabel} · thinking ${ctx.thinkingLevel}`);
+  appendLog(pi, "working", `Sync ${total} sessions · batch ${state.batchSize} · ${modelLabel} · thinking ${ctx.thinkingLevel} · strict tools · attempts ${STRUCTURED_ATTEMPTS}`);
 
   let processed = 0;
   let totalFailures = 0;
@@ -674,7 +769,7 @@ export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
         await sync(pi, ctx);
         profile = await loadProfile();
       } catch (error) {
-        appendLog(pi, "error", `Knowledge sync failed: ${error instanceof Error ? error.message : String(error)}`);
+        appendLog(pi, "error", `Knowledge sync failed: ${shortError(error)}`);
       }
     },
   });
@@ -693,10 +788,7 @@ export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
           return;
         }
         if (config.invalid || !config.key || !validConfigValue(config.key, config.value)) {
-          ctx.ui.notify(
-            "Usage: threshold/batch-size must be 1..1000; profile-max-chars must be 1000..1000000.",
-            "warning",
-          );
+          ctx.ui.notify("Usage: threshold/batch-size must be 1..1000; profile-max-chars must be 1000..1000000.", "warning");
           return;
         }
         if (config.key === "threshold") {
@@ -716,7 +808,7 @@ export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
         await writeState(state);
         ctx.ui.notify(`Knowledge Profile: profile max chars set to ${config.value}.`, "info");
       } catch (error) {
-        ctx.ui.notify(`Knowledge config failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+        ctx.ui.notify(`Knowledge config failed: ${shortError(error)}`, "error");
       }
     },
   });
