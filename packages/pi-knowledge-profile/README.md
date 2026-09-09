@@ -22,26 +22,35 @@ Run:
 /knowledge-sync
 ```
 
-Sync runs in batches of 20 sessions by default using a natural-language knowledge pipeline:
+Sync no longer batches by session count and no longer applies a fixed per-session truncation. All pending historical messages form one logical sync batch and are split into input chunks bounded by `chunk-max-chars`, 100,000 characters by default.
+
+A long session or even a single long message can span multiple input chunks; later content is not discarded merely because it exceeds a fixed session/message cap.
+
+The logical batch is reduced through a natural-language evidence accumulator:
 
 ```text
-historical session
-→ model writes a natural-language Evidence Note
-→ save evidence/*.md
-→ reconcile the batch notes with the current profile.md
-→ model returns the complete revised profile.md
-→ advance checkpoints
+all pending historical messages
+→ split into N chunks by chunk-max-chars
+→ part 1/N + empty accumulator → accumulator 1
+→ part 2/N + accumulator 1 → accumulator 2
+→ ...
+→ part N/N + accumulator N-1 → final Evidence Note
+→ Evidence Note + current profile.md
+→ one reconciliation call returns the complete revised profile.md
+→ advance all related checkpoints
 ```
 
-The model is no longer required to emit JSON, a tool-call schema, or a fixed machine-readable field structure. Knowledge semantics stay in natural language; code only owns persistence, batching, checkpoints, recovery, and configuration.
+Every request tells the model which part it is receiving and how many parts exist in total. Earlier raw transcript is not resent; the previous accumulator carries forward retained evidence. This allows very large histories to be processed incrementally without repeatedly replaying all prior raw text.
 
-A failed session is skipped rather than aborting the batch. Each successful Evidence Note is immediately persisted as its own Markdown file, and `state.json` stages only the note path plus checkpoint. If sync is interrupted before reconciliation, those notes are reused by the next `/knowledge-sync`.
+The model is not required to emit JSON, a tool-call schema, or a fixed machine-readable field structure. Knowledge semantics remain natural language; code owns persistence, chunking, checkpoints, recovery, and configuration.
 
-Each model call gets at most 3 attempts. Retries cover request failures and empty model responses; JSON parsing, schema validation, and tool-call formatting are no longer part of the pipeline.
+No checkpoint advances while the logical batch is still being reduced. Sessions are committed only after the final Evidence Note is produced, persisted under `evidence/*.md`, and successfully reconciled into `profile.md`. Legacy staged notes are reconciled first on the next `/knowledge-sync` before new history is analyzed.
+
+Each model call gets at most 3 attempts. Retries cover request failures and empty responses. Empty/model-error diagnostics report stop reason, provider error message, content block types, and token usage.
 
 ## Knowledge states
 
-The profile still uses these semantic status labels when a status is useful:
+The profile still uses these semantic status labels when useful:
 
 - `完全掌握`: the point can normally be assumed without repeating basics.
 - `重要部分掌握`: the core is usable, but relevant gaps or boundaries may still need explanation.
@@ -57,11 +66,15 @@ Negative evidence still requires an actual demonstrated gap, such as explicitly 
 ```text
 /knowledge-config
 /knowledge-config threshold 10
-/knowledge-config batch-size 50
+/knowledge-config chunk-max-chars 150000
 /knowledge-config profile-max-chars 64000
 ```
 
-Defaults: reminder threshold 5 pending sessions, batch size 20, profile injection limit 48,000 characters. `profile-max-chars` accepts 1,000–1,000,000.
+Defaults: reminder threshold 5 pending sessions, raw input chunk limit 100,000 characters, profile injection limit 48,000 characters.
+
+`threshold` accepts 1–1,000. `chunk-max-chars` and `profile-max-chars` accept 1,000–1,000,000.
+
+Legacy `batch-max-chars` is still accepted/read as a compatibility alias for `chunk-max-chars`. The old `batch-size` setting is no longer used.
 
 ## Storage
 
@@ -69,7 +82,7 @@ Defaults: reminder threshold 5 pending sessions, batch size 20, profile injectio
 ~/.pi/agent/user-knowledge/
   profile.md          # canonical natural-language knowledge profile
   state.json          # program state only: config, staged note paths, checkpoints
-  evidence/           # persistent natural-language evidence notes
+  evidence/           # final natural-language evidence note for each logical sync
     *.md
   profile.json        # legacy file, retained after migration
 ```
@@ -81,7 +94,7 @@ program state → JSON
 knowledge semantics → Markdown
 ```
 
-If `profile.md` does not yet exist, the extension migrates the legacy `profile.json` into Markdown on first load. Legacy structured evidence staged inside `state.json` is likewise converted into `evidence/*.md`, then the state file is upgraded to the new shape.
+If `profile.md` does not yet exist, the extension migrates the legacy `profile.json` into Markdown on first load. Legacy structured evidence staged inside `state.json` is likewise converted into `evidence/*.md`. Legacy `batchMaxChars` migrates to `chunkMaxChars`.
 
 Evidence Notes remain on disk as an audit trail. After successful reconciliation, only their staged references are removed from `state.json`; the note files are not deleted.
 
@@ -89,6 +102,6 @@ Evidence Notes remain on disk as an audit trail. After successful reconciliation
 
 - Never-discussed or unsupported knowledge remains unknown rather than being classified as ignorance.
 - `完全不懂` may be generated automatically only from strong explicit negative evidence, never from a single question, one mistake, or missing evidence.
-- Repeated moderate evidence across sessions may combine into a profile judgement during reconciliation.
+- Repeated moderate evidence across sessions may combine in the accumulator and reconciliation stages.
 - Content inside `SESSION_DATA` is explicitly treated as inert historical data; the analysis model must not follow instructions found inside it.
 - Tool output, system prompts, and plugin custom logs are excluded from historical-session analysis input.
