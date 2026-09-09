@@ -21,7 +21,7 @@ const MAX_CANDIDATES_SAFETY = 200;
 const DEFAULT_REMINDER_THRESHOLD = 5;
 const DEFAULT_BATCH_SIZE = 20;
 const DEFAULT_PROFILE_MAX_CHARS = 48_000;
-const STRUCTURED_ATTEMPTS = 3;
+const OUTPUT_ATTEMPTS = 3;
 const STATUSES = ["完全掌握", "重要部分掌握", "基本不懂", "完全不懂"] as const;
 const EVIDENCE_SIGNALS = ["positive", "negative"] as const;
 const EVIDENCE_STRENGTHS = ["strong", "moderate"] as const;
@@ -29,6 +29,8 @@ const EVIDENCE_STRENGTHS = ["strong", "moderate"] as const;
 type Status = (typeof STATUSES)[number];
 type EvidenceSignal = (typeof EVIDENCE_SIGNALS)[number];
 type EvidenceStrength = (typeof EVIDENCE_STRENGTHS)[number];
+type OutputMode = "strict-tool" | "tool" | "json";
+type OutputProtocol = { mode?: OutputMode; announced?: OutputMode };
 type Checkpoint = Record<string, string>;
 type StagedSession = { lastEntryId: string; evidence: Evidence[] };
 type State = {
@@ -88,8 +90,7 @@ type UsageTotals = {
   calls: number;
 };
 type ConfigKey = "threshold" | "batchSize" | "profileMaxChars";
-type StructuredResult<T> = { value: T; callTokens: number; attempts: number };
-
+type OutputResult<T> = { value: T; callTokens: number; attempts: number; mode: OutputMode };
 type RawEvidenceItem = {
   context: string;
   signal: EvidenceSignal;
@@ -132,6 +133,9 @@ const CANDIDATE_TOOL: Tool = {
   constrainedSampling: { type: "json_schema", strict: "require" },
 };
 
+const EXTRACTION_JSON_INSTRUCTION = `Return only one JSON object with exactly this shape: {"items":[{"context":"what was being discussed","signal":"positive|negative","strength":"strong|moderate","evidence":["concrete evidence"],"caution":null}]}. Use {"items":[]} when there is no meaningful evidence. Do not use markdown fences or add prose.`;
+const RECONCILIATION_JSON_INSTRUCTION = `Return only one JSON object with exactly this shape: {"items":[{"domain":"...","subdomain":"...","knowledgePoint":"...","suggestedStatus":"完全掌握|重要部分掌握|基本不懂|完全不懂","context":"...","evidence":["concrete evidence"],"reason":"..."}]}. Use {"items":[]} when no add or update is justified. Do not use markdown fences or add prose.`;
+
 function defaultState(): State {
   return {
     version: 4,
@@ -169,9 +173,11 @@ function shortError(error: unknown): string {
   return text.replace(/\s+/g, " ").trim().slice(0, 240) || "unknown error";
 }
 
-function isNonRetryableStructuredError(error: unknown): boolean {
+function isStrictUnsupported(error: unknown): boolean {
   const text = shortError(error).toLowerCase();
-  return text.includes("does not support") && (text.includes("strict") || text.includes("constrained"));
+  return text.includes("requires json-schema constrained sampling") ||
+    ((text.includes("strict") || text.includes("constrained sampling")) &&
+      (text.includes("unsupported") || text.includes("not support") || text.includes("does not support")));
 }
 
 function validStatus(value: unknown): value is Status {
@@ -387,62 +393,154 @@ function updateUsage(usage: UsageTotals, answer: { usage: Partial<UsageTotals> }
   usage.calls += 1;
 }
 
-async function askStructured<T>(
+function toolForMode(tool: Tool, mode: "strict-tool" | "tool"): Tool {
+  if (mode === "strict-tool") return tool;
+  const { constrainedSampling: _constrainedSampling, ...normalTool } = tool;
+  return normalTool as Tool;
+}
+
+function forcedToolChoice(api: string, toolName: string): unknown | undefined {
+  if (api === "google-generative-ai" || api === "google-vertex") return "any";
+  if (api === "anthropic-messages" || api === "bedrock-converse-stream") return { type: "tool", name: toolName };
+  if (api === "pi-messages" || api === "mistral-conversations" || api === "openai-completions") {
+    return { type: "function", function: { name: toolName } };
+  }
+  if (api === "openai-responses" || api === "azure-openai-responses" || api === "openai-codex-responses") return "required";
+  return undefined;
+}
+
+function parseJsonObject(text: string): unknown {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim() ?? text.trim();
+  try {
+    return JSON.parse(fenced);
+  } catch {
+    const start = fenced.indexOf("{");
+    const end = fenced.lastIndexOf("}");
+    if (start < 0 || end < start) throw new Error("The analysis model did not return a complete JSON object.");
+    return JSON.parse(fenced.slice(start, end + 1));
+  }
+}
+
+function validateSubmission<T>(tool: Tool, value: unknown): T {
+  return validateToolCall([tool], {
+    type: "toolCall",
+    id: "knowledge-profile-json-fallback",
+    name: tool.name,
+    arguments: value as Record<string, unknown>,
+  }) as T;
+}
+
+async function askTool<T>(
   ctx: ExtensionContext,
   usage: UsageTotals,
   tool: Tool,
+  mode: "strict-tool" | "tool",
   systemPrompt: string,
   prompt: string,
 ): Promise<T> {
   if (!ctx.model) throw new Error("No Pi model is selected. Select a model, then run /knowledge-sync again.");
+  const activeTool = toolForMode(tool, mode);
+  const options: Record<string, unknown> = { reasoning: ctx.thinkingLevel };
+  const toolChoice = forcedToolChoice(String(ctx.model.api), activeTool.name);
+  if (toolChoice !== undefined) options.toolChoice = toolChoice;
+
   const answer = await ctx.modelRegistry.complete(ctx.model, {
     systemPrompt,
     messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
-    tools: [tool],
-  }, { reasoning: ctx.thinkingLevel });
+    tools: [activeTool],
+  }, options as never);
   updateUsage(usage, answer);
 
   const calls = Array.isArray(answer.content)
     ? answer.content.filter((item): item is Extract<(typeof answer.content)[number], { type: "toolCall" }> =>
-      typeof item === "object" && item !== null && item.type === "toolCall" && item.name === tool.name)
+      typeof item === "object" && item !== null && item.type === "toolCall" && item.name === activeTool.name)
     : [];
   if (calls.length !== 1) {
     const text = textContent(answer.content);
     throw new Error(calls.length === 0
-      ? `Expected one ${tool.name} tool call, received none${text ? `; text: ${text.slice(0, 160)}` : ""}.`
-      : `Expected one ${tool.name} tool call, received ${calls.length}.`);
+      ? `Expected one ${activeTool.name} tool call, received none${text ? `; text: ${text.slice(0, 160)}` : ""}.`
+      : `Expected one ${activeTool.name} tool call, received ${calls.length}.`);
   }
-  return validateToolCall([tool], calls[0]) as T;
+  return validateToolCall([activeTool], calls[0]) as T;
 }
 
-async function structuredWithRetries<T>(
+async function askJson<T>(
+  ctx: ExtensionContext,
+  usage: UsageTotals,
+  tool: Tool,
+  systemPrompt: string,
+  prompt: string,
+  jsonInstruction: string,
+): Promise<T> {
+  if (!ctx.model) throw new Error("No Pi model is selected. Select a model, then run /knowledge-sync again.");
+  const answer = await ctx.modelRegistry.complete(ctx.model, {
+    systemPrompt: `${systemPrompt}\n\n${jsonInstruction}`,
+    messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
+  }, { reasoning: ctx.thinkingLevel });
+  updateUsage(usage, answer);
+  return validateSubmission<T>(toolForMode(tool, "tool"), parseJsonObject(textContent(answer.content)));
+}
+
+function modesFrom(mode?: OutputMode): OutputMode[] {
+  if (mode === "json") return ["json"];
+  if (mode === "tool") return ["tool", "json"];
+  return ["strict-tool", "tool", "json"];
+}
+
+function announceMode(pi: ExtensionAPI, protocol: OutputProtocol, mode: OutputMode): void {
+  if (protocol.announced === mode) return;
+  appendLog(pi, mode === "strict-tool" ? "info" : "warning", `Knowledge sync output mode: ${mode}`);
+  protocol.announced = mode;
+}
+
+async function outputWithFallback<T>(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   usage: UsageTotals,
+  protocol: OutputProtocol,
   label: string,
   tool: Tool,
   systemPrompt: string,
   prompt: string,
-): Promise<StructuredResult<T>> {
+  jsonInstruction: string,
+): Promise<OutputResult<T>> {
   const beforeTokens = usage.totalTokens;
+  let totalAttempts = 0;
   let lastError: unknown;
-  for (let attempt = 1; attempt <= STRUCTURED_ATTEMPTS; attempt += 1) {
-    try {
-      const value = await askStructured<T>(ctx, usage, tool, systemPrompt, prompt);
-      return { value, callTokens: usage.totalTokens - beforeTokens, attempts: attempt };
-    } catch (error) {
-      lastError = error;
-      const reason = shortError(error);
-      if (isNonRetryableStructuredError(error)) {
-        throw new Error(`${label} failed: ${reason}`);
-      }
-      if (attempt < STRUCTURED_ATTEMPTS) {
-        appendLog(pi, "warning", `${label} · attempt ${attempt}/${STRUCTURED_ATTEMPTS} failed · ${reason}`);
-        appendLog(pi, "working", `${label} · retry ${attempt + 1}/${STRUCTURED_ATTEMPTS}`);
+  const modes = modesFrom(protocol.mode);
+
+  for (const [modeIndex, mode] of modes.entries()) {
+    let modeError: unknown;
+    for (let attempt = 1; attempt <= OUTPUT_ATTEMPTS; attempt += 1) {
+      totalAttempts += 1;
+      try {
+        const value = mode === "json"
+          ? await askJson<T>(ctx, usage, tool, systemPrompt, prompt, jsonInstruction)
+          : await askTool<T>(ctx, usage, tool, mode, systemPrompt, prompt);
+        protocol.mode = mode;
+        announceMode(pi, protocol, mode);
+        return { value, callTokens: usage.totalTokens - beforeTokens, attempts: totalAttempts, mode };
+      } catch (error) {
+        lastError = error;
+        modeError = error;
+        const reason = shortError(error);
+        if (mode === "strict-tool" && isStrictUnsupported(error)) break;
+        if (attempt < OUTPUT_ATTEMPTS) {
+          appendLog(pi, "warning", `${label} · ${mode} attempt ${attempt}/${OUTPUT_ATTEMPTS} failed · ${reason}`);
+          appendLog(pi, "working", `${label} · ${mode} retry ${attempt + 1}/${OUTPUT_ATTEMPTS}`);
+        }
       }
     }
+
+    const nextMode = modes[modeIndex + 1];
+    if (nextMode) {
+      appendLog(pi, "warning", `${label} · ${mode} unavailable · falling back to ${nextMode} · ${shortError(modeError)}`);
+      protocol.mode = nextMode;
+      announceMode(pi, protocol, nextMode);
+    }
   }
-  throw new Error(`${label} failed after ${STRUCTURED_ATTEMPTS} attempts: ${shortError(lastError)}`);
+
+  throw new Error(`${label} failed after output fallback: ${shortError(lastError)}`);
 }
 
 function normalizeEvidenceSubmission(value: EvidenceSubmission, session: string): Evidence[] {
@@ -479,9 +577,9 @@ function normalizeCandidates(value: CandidateSubmission): Candidate[] {
   }).slice(0, MAX_CANDIDATES_SAFETY);
 }
 
-const EXTRACTION_SYSTEM = `You extract evidence about both what a user understands and what they do not yet understand from one Pi conversation. You must finish by calling submit_knowledge_evidence exactly once. Do not return the result as text. Call the tool with items=[] when there is no meaningful evidence. Positive evidence includes correct explanation, correction, comparison, boundary reasoning, application, or repeated competent use. Negative evidence requires actual evidence of a knowledge gap: an explicit statement of not knowing or lacking background, a clearly incorrect explanation of a core concept, repeated confusion after explanation, or an explicit request to start from basics tied to stated lack of knowledge. A question alone, a request for explanation alone, isolated terminology use, acknowledgement, or accepting an answer is never negative evidence. Do not infer ignorance from absence. Use strong when the evidence directly establishes the signal; use moderate when it is credible but narrower or indirect. Preserve useful moderate evidence so cross-session reconciliation can combine repeated signals. Do not assess preferences, personality, task state, or the assistant's knowledge.`;
+const EXTRACTION_SYSTEM = `You extract evidence about both what a user understands and what they do not yet understand from one Pi conversation. If tools are available, you must finish by calling submit_knowledge_evidence exactly once and must not return the result as text. Submit items=[] when there is no meaningful evidence. Positive evidence includes correct explanation, correction, comparison, boundary reasoning, application, or repeated competent use. Negative evidence requires actual evidence of a knowledge gap: an explicit statement of not knowing or lacking background, a clearly incorrect explanation of a core concept, repeated confusion after explanation, or an explicit request to start from basics tied to stated lack of knowledge. A question alone, a request for explanation alone, isolated terminology use, acknowledgement, or accepting an answer is never negative evidence. Do not infer ignorance from absence. Use strong when the evidence directly establishes the signal; use moderate when it is credible but narrower or indirect. Preserve useful moderate evidence so cross-session reconciliation can combine repeated signals. Do not assess preferences, personality, task state, or the assistant's knowledge.`;
 
-const RECONCILIATION_SYSTEM = `You reconcile cross-session evidence into an automatically maintained user knowledge profile. You must finish by calling submit_knowledge_candidates exactly once. Do not return the result as text. Call the tool with items=[] when no profile add or update is justified. The profile is bidirectional: it records both what may be assumed and what should be explained. Unknown or never-discussed knowledge must remain absent, not be classified as ignorance. Use positive and negative evidence together, including repeated moderate evidence across sessions. 完全掌握 means the user demonstrates reliable command including relevant boundaries or application. 重要部分掌握 means the core is usable but some limits remain. 基本不懂 means there is concrete evidence of material gaps, misconceptions, or unstable understanding, while some familiarity may exist. 完全不懂 requires strong explicit evidence of essentially no foundation in that specific knowledge point; never infer it merely from a question, one mistake, or missing evidence. Existing points may move in either direction only when new evidence justifies the change. Keep knowledge points narrow enough that the evidence genuinely supports the status. Include only points for which the evidence justifies an add or update.`;
+const RECONCILIATION_SYSTEM = `You reconcile cross-session evidence into an automatically maintained user knowledge profile. If tools are available, you must finish by calling submit_knowledge_candidates exactly once and must not return the result as text. Submit items=[] when no profile add or update is justified. The profile is bidirectional: it records both what may be assumed and what should be explained. Unknown or never-discussed knowledge must remain absent, not be classified as ignorance. Use positive and negative evidence together, including repeated moderate evidence across sessions. 完全掌握 means the user demonstrates reliable command including relevant boundaries or application. 重要部分掌握 means the core is usable but some limits remain. 基本不懂 means there is concrete evidence of material gaps, misconceptions, or unstable understanding, while some familiarity may exist. 完全不懂 requires strong explicit evidence of essentially no foundation in that specific knowledge point; never infer it merely from a question, one mistake, or missing evidence. Existing points may move in either direction only when new evidence justifies the change. Keep knowledge points narrow enough that the evidence genuinely supports the status. Include only points for which the evidence justifies an add or update.`;
 
 async function extractEvidence(
   pi: ExtensionAPI,
@@ -491,6 +589,7 @@ async function extractEvidence(
   offset: number,
   total: number,
   usage: UsageTotals,
+  protocol: OutputProtocol,
 ): Promise<ExtractionResult> {
   const completed: Transcript[] = [];
   const failures: AnalysisFailure[] = [];
@@ -499,14 +598,16 @@ async function extractEvidence(
     const session = basename(transcript.path);
     const label = `${position}/${total} ${session}`;
     try {
-      const result = await structuredWithRetries<EvidenceSubmission>(
+      const result = await outputWithFallback<EvidenceSubmission>(
         pi,
         ctx,
         usage,
+        protocol,
         label,
         EVIDENCE_TOOL,
         EXTRACTION_SYSTEM,
         `Analyze this one new session. Its file is ${session}.\n\n${transcript.text}`,
+        EXTRACTION_JSON_INSTRUCTION,
       );
       const items = normalizeEvidenceSubmission(result.value, session);
       completed.push(transcript);
@@ -519,7 +620,7 @@ async function extractEvidence(
       appendLog(
         pi,
         "success",
-        `${label} · evidence ${items.length} · ${formatTokens(result.callTokens)} tok · attempts ${result.attempts} · total ${formatTokens(usage.totalTokens)}`,
+        `${label} · evidence ${items.length} · ${formatTokens(result.callTokens)} tok · ${result.mode} · attempts ${result.attempts} · total ${formatTokens(usage.totalTokens)}`,
       );
     } catch (error) {
       const reason = shortError(error);
@@ -538,15 +639,18 @@ async function reconcile(
   usage: UsageTotals,
   profileMaxChars: number,
   batchLabel: string,
-): Promise<StructuredResult<Candidate[]>> {
-  const result = await structuredWithRetries<CandidateSubmission>(
+  protocol: OutputProtocol,
+): Promise<OutputResult<Candidate[]>> {
+  const result = await outputWithFallback<CandidateSubmission>(
     pi,
     ctx,
     usage,
+    protocol,
     `${batchLabel} reconcile`,
     CANDIDATE_TOOL,
     RECONCILIATION_SYSTEM,
     `## Existing profile\n${profileForPrompt(profile, profileMaxChars)}\n\n## Cross-session evidence\n${JSON.stringify(evidence, null, 2)}`,
+    RECONCILIATION_JSON_INSTRUCTION,
   );
   return { ...result, value: normalizeCandidates(result.value) };
 }
@@ -595,6 +699,7 @@ async function commitStaged(
   ctx: ExtensionCommandContext,
   state: State,
   usage: UsageTotals,
+  protocol: OutputProtocol,
   failures = 0,
   batchLabel = "Batch",
 ): Promise<BatchCommitResult> {
@@ -611,11 +716,11 @@ async function commitStaged(
   if (evidence.length > 0) {
     appendLog(pi, "working", `${batchLabel} · reconciling · total ${formatTokens(usage.totalTokens)} tok`);
     const profile = await loadProfile();
-    const result = await reconcile(pi, ctx, profile, evidence, usage, state.profileMaxChars, batchLabel);
+    const result = await reconcile(pi, ctx, profile, evidence, usage, state.profileMaxChars, batchLabel, protocol);
     changes = result.value.map((candidate) => upsertCandidate(profile, candidate));
     await writeProfile(profile);
     await renderViews(profile);
-    appendLog(pi, "info", `${batchLabel} · reconcile attempts ${result.attempts} · ${formatTokens(result.callTokens)} tok`);
+    appendLog(pi, "info", `${batchLabel} · reconcile ${result.mode} · attempts ${result.attempts} · ${formatTokens(result.callTokens)} tok`);
   }
 
   state.checkpoints = checkpoints;
@@ -630,6 +735,7 @@ async function sync(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<voi
   const pending = await collectPending(state);
   const total = pendingSessionCount(state, pending);
   const usage = emptyUsage();
+  const protocol: OutputProtocol = {};
 
   if (total === 0) {
     appendLog(pi, "info", "No new sessions to sync.");
@@ -638,7 +744,7 @@ async function sync(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<voi
 
   if (!ctx.model) throw new Error("No Pi model is selected. Select a model, then run /knowledge-sync again.");
   const modelLabel = `${ctx.model.provider}/${ctx.model.id}`;
-  appendLog(pi, "working", `Sync ${total} sessions · batch ${state.batchSize} · ${modelLabel} · thinking ${ctx.thinkingLevel} · strict tools · attempts ${STRUCTURED_ATTEMPTS}`);
+  appendLog(pi, "working", `Sync ${total} sessions · batch ${state.batchSize} · ${modelLabel} · thinking ${ctx.thinkingLevel} · output auto strict-tool→tool→json · attempts ${OUTPUT_ATTEMPTS}`);
 
   let processed = 0;
   let totalFailures = 0;
@@ -659,13 +765,13 @@ async function sync(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<voi
     let failures = 0;
 
     if (batch.length > 0) {
-      const extraction = await extractEvidence(pi, ctx, state, batch, processed, total, usage);
+      const extraction = await extractEvidence(pi, ctx, state, batch, processed, total, usage, protocol);
       failures = extraction.failures.length;
       totalFailures += failures;
       processed += extraction.completed.length + failures;
     }
 
-    const committed = await commitStaged(pi, ctx, state, usage, failures, batchLabel);
+    const committed = await commitStaged(pi, ctx, state, usage, protocol, failures, batchLabel);
     totalAdded += committed.changes.filter((item) => item.kind === "added").length;
     totalUpdated += committed.changes.filter((item) => item.kind === "updated").length;
 
@@ -675,7 +781,7 @@ async function sync(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<voi
   appendLog(
     pi,
     "success",
-    `Complete · sessions ${total} · batches ${batchNumber} · +${totalAdded} ~${totalUpdated} · failed ${totalFailures} · calls ${usage.calls} · in ${formatTokens(usage.input)} · out ${formatTokens(usage.output)} · cache ${formatTokens(usage.cacheRead)}/${formatTokens(usage.cacheWrite)} · total ${formatTokens(usage.totalTokens)} tok`,
+    `Complete · sessions ${total} · batches ${batchNumber} · mode ${protocol.mode ?? "unknown"} · +${totalAdded} ~${totalUpdated} · failed ${totalFailures} · calls ${usage.calls} · in ${formatTokens(usage.input)} · out ${formatTokens(usage.output)} · cache ${formatTokens(usage.cacheRead)}/${formatTokens(usage.cacheWrite)} · total ${formatTokens(usage.totalTokens)} tok`,
   );
 }
 
