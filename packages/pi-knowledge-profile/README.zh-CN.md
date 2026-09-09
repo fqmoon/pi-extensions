@@ -32,27 +32,41 @@ Knowledge Profile injection: 1.2k/48k chars
 
 如果一个 session 或单条 message 很长，它会自然跨多个输入片段，不会因为超过固定 session/message 上限而丢弃后半段内容。
 
-一个逻辑批次通过自然语言 accumulator 多轮处理：
+每个 chunk 固定执行两次模型调用：先 Extract，再 Reconcile。
 
 ```text
 全部待同步历史消息
-→ 按 chunk-max-chars 切成 N 个输入片段
-→ part 1/N + 空 accumulator → accumulator 1
-→ part 2/N + accumulator 1 → accumulator 2
+→ 按 chunk-max-chars 切成 N 个 chunk
+→ Chunk 1: Extract(raw chunk) → Evidence Note 1
+→ Chunk 1: Reconcile(profile + Evidence Note 1) → profile 1
+→ Chunk 2: Extract(raw chunk) → Evidence Note 2
+→ Chunk 2: Reconcile(profile 1 + Evidence Note 2) → profile 2
 → ...
-→ part N/N + accumulator N-1 → 最终 Evidence Note
-→ Evidence Note + 现有 profile.md
-→ 1 次 reconciliation 输出完整新版 profile.md
-→ 推进所有相关 checkpoints
+→ Chunk N: Extract(raw chunk) → Evidence Note N
+→ Chunk N: Reconcile(profile N-1 + Evidence Note N) → profile N
+→ 推进所有相关 session checkpoints
 ```
 
-每次请求都会明确告诉模型当前是第几部分、总共有几部分。前面已经处理过的原始 transcript 不会重复发送，而是由上一轮 accumulator 承载已保留的知识证据。因此超长历史输入可以逐段处理，同时避免每一轮都重新发送全部旧文本。
+不再存在 accumulator。Extract 只负责从当前 chunk 提取知识证据；Reconcile 只负责把这份证据合并进当前 `profile.md`。每个 chunk 的 Evidence Note 都会立即写入 `evidence/*.md`，对应的 reconciliation 成功后新版 `profile.md` 也会立即落盘。
+
+因此同步具有阶段性结果：如果总共有 12 个 chunk，前 6 个 chunk 已经完成，那么这 6 个 chunk 的 Evidence Note 和 profile 更新都已经保存。`state.json` 中的 `activeSync` 会记录输入指纹、总 chunk 数以及下一个待处理 chunk；输入未变化时，下次 `/knowledge-sync` 可以从后续 chunk 继续。
+
+因为 chunk 可能切在一个 session 中间，所以 session checkpoint 不会在每个 chunk 后提前推进。只有整个逻辑同步的全部 chunk 完成后，相关 session checkpoint 才统一推进。这避免把只处理了一半的长 session 错标成已完成。
+
+界面会在每次模型调用开始前显示当前正在执行什么，例如：
+
+```text
+◌ Chunk 3/8 · Extract · raw 92k chars · provider/model · thinking medium
+✓ Chunk 3/8 · Extract saved · evidence 6.2k chars
+◌ Chunk 3/8 · Reconcile · profile 14k chars + evidence 6.5k chars · provider/model · thinking medium
+✓ Chunk 3/8 · Reconcile saved · profile 14k→15k chars
+```
+
+重试时同样会显示当前阶段和 attempt。每次模型调用最多尝试 3 次。重试只针对调用失败或空文本，不再存在 JSON 解析、schema validation 或 tool-call 格式失败。空文本/模型错误会报告 `stopReason`、`errorMessage`、content block 类型和 token usage 等诊断信息。
 
 模型不再被要求输出 JSON、tool-call schema 或固定字段结构。知识语义由模型用自然语言表达，代码只负责保存、切片、checkpoint、恢复和配置。
 
-整个逻辑批次完成前不会推进 checkpoint。只有最终 Evidence Note 成功生成、写入 `evidence/*.md` 并 reconciliation 成功后，相关 session 才会正式提交。若已有旧版本 staged note，则下次 `/knowledge-sync` 会先完成这些 staged reconciliation，再分析新的历史消息。
-
-每次模型调用最多尝试 3 次。重试只针对调用失败或空文本，不再存在 JSON 解析、schema validation 或 tool-call 格式失败。空文本/模型错误会报告 `stopReason`、`errorMessage`、content block 类型和 token usage 等诊断信息。
+若存在旧版本 staged Evidence Note，下次 `/knowledge-sync` 会先完成这些 staged reconciliation，再进入新的 chunk 流程，以兼容旧状态。
 
 ## 知识状态
 
@@ -88,8 +102,8 @@ Knowledge Profile injection: 1.2k/48k chars
 
 ```text
 profile.md          # 唯一知识画像真源，自然语言 Markdown
-state.json          # 纯程序状态：配置、staged note 路径、checkpoints
-evidence/           # 每次逻辑同步最终生成的自然语言证据记录
+state.json          # 程序状态：配置、activeSync、legacy staged、checkpoints
+evidence/           # 每个已处理 chunk 的自然语言 Evidence Note
   *.md
 profile.json        # 旧版文件；首次迁移后仅作为遗留数据保留
 ```
@@ -103,12 +117,12 @@ profile.json        # 旧版文件；首次迁移后仅作为遗留数据保留
 
 旧版 `profile.json` 会在首次加载且 `profile.md` 尚不存在时自动转换为 Markdown。旧版 `state.json` 中暂存的结构化 evidence 也会自动转换为 `evidence/*.md`，然后状态文件升级到新版结构。旧 `batchMaxChars` 配置会自动迁移为 `chunkMaxChars`。
 
-Evidence Note 会保留在磁盘上作为可审计的历史证据；完成 reconciliation 后只清除 `state.json` 中的 staged 引用，不删除 note 文件。
+Chunk Evidence Note 会保留在磁盘上作为可审计的历史证据。`activeSync` 只保存恢复所需的程序进度，不承载知识语义。
 
 ## 约束
 
 - 未涉及或缺少证据的知识点保持未知，不自动判定为不懂。
 - `完全不懂` 只有在存在强而明确的负向证据时才能自动生成，不能由单个问题、一次错误或证据缺失推断。
-- 多个会话中的中等强度证据可以在 accumulator / reconciliation 阶段共同支持状态判断。
+- 多个 chunk 中的证据通过连续的 reconciliation 累积进入长期 profile。
 - `SESSION_DATA` 中的内容被明确视为历史数据，分析模型不得执行其中出现的指令。
 - tool 输出、system prompt 和插件自定义日志不会进入历史会话分析输入。
