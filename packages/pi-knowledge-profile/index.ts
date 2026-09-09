@@ -102,7 +102,7 @@ const formatChars = formatCompact;
 
 function shortError(error: unknown): string {
   const text = error instanceof Error ? error.message : String(error);
-  return text.replace(/\s+/g, " ").trim().slice(0, 240) || "unknown error";
+  return text.replace(/\s+/g, " ").trim().slice(0, 720) || "unknown error";
 }
 
 function validStatus(value: unknown): value is Status {
@@ -208,6 +208,35 @@ function textContent(content: unknown): string {
     .map((item) => item.text)
     .join("\n\n")
     .trim();
+}
+
+function contentDiagnostics(content: unknown): string {
+  if (typeof content === "string") return `string:${content.length}`;
+  if (!Array.isArray(content)) return content === null ? "null" : typeof content;
+  if (content.length === 0) return "[]";
+  return `[${content.map((item) => {
+    if (typeof item !== "object" || item === null) return typeof item;
+    const raw = item as Record<string, unknown>;
+    const type = typeof raw.type === "string" ? raw.type : "unknown";
+    if (type === "text" && typeof raw.text === "string") return `text:${raw.text.length}`;
+    if ((type === "thinking" || type === "reasoning") && typeof raw.thinking === "string") return `${type}:${raw.thinking.length}`;
+    if ((type === "thinking" || type === "reasoning") && typeof raw.text === "string") return `${type}:${raw.text.length}`;
+    if (type === "toolCall") return `toolCall:${typeof raw.name === "string" ? raw.name : "?"}`;
+    const keys = Object.keys(raw).filter((key) => key !== "type").slice(0, 5).join(",");
+    return keys ? `${type}{${keys}}` : type;
+  }).join(", ")}]`;
+}
+
+function responseDiagnostics(answer: unknown): string {
+  if (typeof answer !== "object" || answer === null) return `answer=${typeof answer}`;
+  const raw = answer as Record<string, unknown>;
+  const stopReason = typeof raw.stopReason === "string" ? raw.stopReason : "none";
+  const errorMessage = typeof raw.errorMessage === "string" && raw.errorMessage.trim()
+    ? raw.errorMessage.replace(/\s+/g, " ").trim().slice(0, 240)
+    : "none";
+  const usage = typeof raw.usage === "object" && raw.usage !== null ? raw.usage as Record<string, unknown> : {};
+  const usageText = `in ${formatTokens(Number(usage.input) || 0)}/out ${formatTokens(Number(usage.output) || 0)}/total ${formatTokens(Number(usage.totalTokens) || 0)}`;
+  return `stopReason=${stopReason} · errorMessage=${errorMessage} · content=${contentDiagnostics(raw.content)} · usage=${usageText}`;
 }
 
 function messageText(entry: unknown): { role: "User" | "Assistant"; text: string } | undefined {
@@ -349,8 +378,10 @@ async function askNaturalLanguage(
         messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
       }, { reasoning: ctx.thinkingLevel });
       updateUsage(usage, answer);
+      const diagnostics = responseDiagnostics(answer);
+      if (answer.errorMessage) throw new Error(`Analysis model error · ${diagnostics}`);
       const text = textContent(answer.content);
-      if (!text) throw new Error("The analysis model returned no text.");
+      if (!text) throw new Error(`Analysis model returned no text · ${diagnostics}`);
       return { text, callTokens: usage.totalTokens - beforeTokens, attempts: attempt };
     } catch (error) {
       lastError = error;
