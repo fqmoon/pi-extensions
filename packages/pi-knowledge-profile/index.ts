@@ -322,40 +322,32 @@ function sourceHash(sessions: PendingSession[], chunkMaxChars: number): string {
     .digest("hex");
 }
 
-function splitText(text: string, maxChars: number): string[] {
-  const parts: string[] = [];
-  for (let start = 0; start < text.length; start += maxChars) parts.push(text.slice(start, start + maxChars));
-  return parts;
+function renderPendingSession(session: PendingSession): string {
+  const messages = session.messages.map((message) => `### ${message.role}\n\n${message.text}`).join("\n\n");
+  return `## Session: ${basename(session.path)}\n\n${messages}`;
 }
 
 function buildChunks(sessions: PendingSession[], maxChars: number): string[] {
-  const units: string[] = [];
-  for (const session of sessions) {
-    for (const message of session.messages) {
-      const prefix = `## Session: ${basename(session.path)}\n### ${message.role}\n\n`;
-      const available = Math.max(1, maxChars - prefix.length - 80);
-      const parts = splitText(message.text, available);
-      for (const [index, part] of parts.entries()) {
-        const partLabel = parts.length > 1 ? `\n\n[message part ${index + 1}/${parts.length}]` : "";
-        units.push(`${prefix}${part}${partLabel}`);
-      }
-    }
-  }
-
   const chunks: string[] = [];
   let current = "";
-  for (const unit of units) {
+
+  for (const session of sessions) {
+    const unit = renderPendingSession(session);
     if (!current) {
       current = unit;
       continue;
     }
+
     const joined = `${current}\n\n---\n\n${unit}`;
-    if (joined.length <= maxChars) current = joined;
-    else {
-      chunks.push(current);
-      current = unit;
+    if (joined.length <= maxChars) {
+      current = joined;
+      continue;
     }
+
+    chunks.push(current);
+    current = unit;
   }
+
   if (current) chunks.push(current);
   return chunks;
 }
@@ -572,10 +564,19 @@ async function sync(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<voi
     await writeState(state);
   }
 
+  const oversizedSessions = pending.filter((session) => renderPendingSession(session).length > state.chunkMaxChars);
+  if (oversizedSessions.length > 0) {
+    appendLog(
+      pi,
+      "warning",
+      `${oversizedSessions.length} session${oversizedSessions.length === 1 ? "" : "s"} exceed chunk max and will each remain intact in an oversized chunk.`,
+    );
+  }
+
   appendLog(
     pi,
     "working",
-    `Sync ${pending.length} sessions · ${formatChars(pendingChars(pending))} chars · ${chunks.length} chunks · chunk max ${formatChars(state.chunkMaxChars)} · ${ctx.model.provider}/${ctx.model.id} · thinking ${ctx.thinkingLevel}`,
+    `Sync ${pending.length} sessions · ${formatChars(pendingChars(pending))} chars · ${chunks.length} chunks · chunk target ${formatChars(state.chunkMaxChars)} · ${ctx.model.provider}/${ctx.model.id} · thinking ${ctx.thinkingLevel}`,
   );
 
   for (let index = startChunk; index < chunks.length; index += 1) {
@@ -703,7 +704,7 @@ export default function knowledgeProfileExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("knowledge-sync", {
-    description: "Extract and reconcile each character-bounded history chunk incrementally",
+    description: "Extract and reconcile history in session-bounded chunks incrementally",
     handler: async (_args, ctx) => {
       try {
         await sync(pi, ctx);
