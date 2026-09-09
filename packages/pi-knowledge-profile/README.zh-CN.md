@@ -28,20 +28,24 @@ Knowledge Profile injection: 1.2k/48k chars
 /knowledge-sync
 ```
 
-同步默认每 20 个会话为一批，采用自然语言知识流水线：
+同步按批处理历史会话。每个 batch 最多包含 `batch-size` 个 session，同时累计 transcript 字符数不能超过 `batch-max-chars`；任一限制先达到就封批。默认值分别为 20 个 session 和 100,000 字符。单个 session 仍先受内部 `MAX_SESSION_CHARS = 24,000` 限制，因此默认配置下不会出现单个 session 独自突破 batch 字符预算的情况。
+
+每个 batch 只调用一次 extraction，再调用一次 reconciliation：
 
 ```text
-历史会话
-→ 模型生成自然语言 Evidence Note
+一批历史会话
+→ 1 次模型调用生成 Batch Evidence Note
 → 保存 evidence/*.md
-→ 聚合本批 Evidence Notes + 现有 profile.md
-→ 模型直接输出完整新版 profile.md
-→ 推进 checkpoints
+→ Batch Evidence Note + 现有 profile.md
+→ 1 次模型调用输出完整新版 profile.md
+→ 推进本批 checkpoints
 ```
+
+这意味着 200 个 session 不再产生约 200 次 extraction 请求，而通常只需要约 10 个 batch 的 extraction 加 10 次 reconciliation，具体批次数由 session 数量和字符预算共同决定。
 
 模型不再被要求输出 JSON、tool-call schema 或固定字段结构。知识语义由模型用自然语言表达，代码只负责保存、批处理、checkpoint 和恢复。
 
-单个会话分析失败会跳过并继续。成功生成的 Evidence Note 会立即写入独立 Markdown 文件，并在 `state.json` 中暂存该文件路径。如果同步在 reconciliation 前中断，这些 note 会在下一次 `/knowledge-sync` 中继续使用。
+一个 batch 的 extraction 失败时，该批 session 不会推进 checkpoint，并记录失败后继续处理下一批。成功生成的 Batch Evidence Note 会立即写入 Markdown 文件，并在 `state.json` 中让该批所有 session 指向同一个 note 路径。如果同步在 reconciliation 前中断，这个 note 会在下一次 `/knowledge-sync` 中继续使用，不会重新 extraction。
 
 每次模型调用最多尝试 3 次。重试只针对调用失败或空文本，不再存在 JSON 解析、schema validation 或 tool-call 格式失败。
 
@@ -64,10 +68,13 @@ Knowledge Profile injection: 1.2k/48k chars
 /knowledge-config
 /knowledge-config threshold 10
 /knowledge-config batch-size 50
+/knowledge-config batch-max-chars 150000
 /knowledge-config profile-max-chars 64000
 ```
 
-默认值：提醒阈值 5 个待同步会话，batch size 20 个会话，Profile 最大注入长度 48,000 字符。`profile-max-chars` 可配置范围为 1,000–1,000,000。
+默认值：提醒阈值 5 个待同步会话，batch size 20 个会话，batch 最大 transcript 长度 100,000 字符，Profile 最大注入长度 48,000 字符。
+
+`threshold` / `batch-size` 可配置范围为 1–1,000；`batch-max-chars` / `profile-max-chars` 可配置范围为 1,000–1,000,000。
 
 ## 存储
 
@@ -76,7 +83,7 @@ Knowledge Profile injection: 1.2k/48k chars
 ```text
 profile.md          # 唯一知识画像真源，自然语言 Markdown
 state.json          # 纯程序状态：配置、staged note 路径、checkpoints
-evidence/           # 每个已分析会话的自然语言证据记录
+evidence/           # 每个已分析 batch 的自然语言证据记录
   *.md
 profile.json        # 旧版文件；首次迁移后仅作为遗留数据保留
 ```
@@ -90,7 +97,7 @@ profile.json        # 旧版文件；首次迁移后仅作为遗留数据保留
 
 旧版 `profile.json` 会在首次加载且 `profile.md` 尚不存在时自动转换为 Markdown。旧版 `state.json` 中暂存的结构化 evidence 也会自动转换为 `evidence/*.md`，然后状态文件升级到新版结构。
 
-Evidence Note 会保留在磁盘上作为可审计的历史证据；完成 reconciliation 后只清除 `state.json` 中的 staged 引用，不删除 note 文件。
+Batch Evidence Note 会保留在磁盘上作为可审计的历史证据；完成 reconciliation 后只清除 `state.json` 中的 staged 引用，不删除 note 文件。
 
 ## 约束
 
