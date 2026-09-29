@@ -5,7 +5,7 @@ import {
   formatSnapshot,
   freshState,
   isAction,
-  REQUEST_TYPE,
+  CHECK_TYPE,
   restoreState,
   SNAPSHOT_TYPE,
   TOOL_NAME,
@@ -19,15 +19,20 @@ Do not include a separate progress report. Continue the original task after the 
 export default function (pi: ExtensionAPI) {
   let state = freshState();
   let awaitingSnapshot = false;
+  let injectSnapshotRequest = false;
 
+  const clearRequest = () => {
+    awaitingSnapshot = false;
+    injectSnapshotRequest = false;
+  };
   const reset = () => {
     state = freshState();
-    awaitingSnapshot = false;
+    clearRequest();
   };
   const restore = (branch: Parameters<typeof restoreState>[0]) => {
     state = restoreState(branch);
     // An interrupted request must not become a new autonomous run on resume.
-    awaitingSnapshot = false;
+    clearRequest();
   };
 
   const onSessionPath = (branch: Parameters<typeof restoreState>[0]) => {
@@ -43,15 +48,23 @@ export default function (pi: ExtensionAPI) {
     if (event.message.role === "user") reset();
   });
 
+  pi.on("context", (event) => {
+    if (!injectSnapshotRequest) return;
+    injectSnapshotRequest = false;
+    return {
+      messages: [...event.messages, { role: "user", content: REQUEST, timestamp: Date.now() }],
+    };
+  });
+
   pi.registerTool({
     name: TOOL_NAME,
     label: "WhereAmI",
     description: "Record a brief position snapshot when requested by the whereami extension. Not a task action.",
     parameters: Type.Object({
-      level: Type.Optional(Type.String({ description: "Current abstraction level" })),
-      scope: Type.Optional(Type.String({ description: "Current problem area" })),
-      state: Type.Optional(Type.String({ description: "Current understanding, not reasoning" })),
-      next: Type.Optional(Type.String({ description: "Next key action" })),
+      level: Type.String({ description: "Current abstraction level" }),
+      scope: Type.String({ description: "Current problem area" }),
+      state: Type.String({ description: "Current understanding, not reasoning" }),
+      next: Type.String({ description: "Next key action" }),
     }),
     async execute(_toolCallId, params) {
       const snapshot = awaitingSnapshot ? formatSnapshot(params) : undefined;
@@ -63,20 +76,41 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("turn_end", (event, ctx) => {
-    // Do not sample the old run while a new message is queued for delivery.
-    if (ctx.hasPendingMessages()) return;
     // The boundary runs after the entire tool batch has been persisted. Never insert
     // a custom message between a tool call and its result (invalid on replay).
     const entries = [...event.entries];
     if (awaitingSnapshot) {
-      const snapshot = event.toolResults
-        .filter((result) => result.toolName === TOOL_NAME && !result.isError)
-        .map((result) => (result.details as { snapshot?: unknown } | undefined)?.snapshot)
-        .find((value): value is string => typeof value === "string");
-      if (snapshot) entries.push({ type: "custom_message", customType: SNAPSHOT_TYPE, content: snapshot, display: true });
-      awaitingSnapshot = false;
+      const snapshotIndex = event.toolResults.findIndex(
+        (result) => result.toolName === TOOL_NAME && !result.isError &&
+          typeof (result.details as { snapshot?: unknown } | undefined)?.snapshot === "string",
+      );
+      if (snapshotIndex >= 0) {
+        const snapshot = (event.toolResults[snapshotIndex].details as { snapshot: string }).snapshot;
+        // Only omit an assistant entry if it carries nothing but this snapshot call.
+        // ID alignment can be lost if Pi could not persist one of the tool results.
+        const result = event.toolResults[snapshotIndex];
+        const snapshotOnly = event.toolResults.length === 1 && result.toolName === TOOL_NAME &&
+          event.message.role === "assistant" && event.message.content.length === 1 &&
+          event.message.content[0].type === "toolCall" &&
+          event.message.content[0].name === TOOL_NAME &&
+          event.message.content[0].id === result.toolCallId;
+        const resultId = event.toolResultEntryIds.length === event.toolResults.length
+          ? event.toolResultEntryIds[snapshotIndex] : undefined;
+        const assistantEntry = event.messageEntryId && ctx.sessionManager.getEntry(event.messageEntryId);
+        const resultEntry = resultId && ctx.sessionManager.getEntry(resultId);
+        if (snapshotOnly && assistantEntry?.type === "message" && assistantEntry.message.role === "assistant" &&
+          resultEntry?.type === "message" && resultEntry.message.role === "toolResult" &&
+          resultEntry.message.toolCallId === result.toolCallId) {
+          entries.push({ type: "context_edit", targetId: event.messageEntryId, replacement: null });
+          entries.push({ type: "context_edit", targetId: resultId, replacement: null });
+        }
+        entries.push({ type: "custom_message", customType: SNAPSHOT_TYPE, content: snapshot, display: true });
+      }
+      clearRequest();
     }
 
+    // Do not sample the old run while a new message is queued for delivery.
+    if (ctx.hasPendingMessages()) return entries.length > event.entries.length ? { entries } : undefined;
     const actionCount = event.toolResults.filter((result) => isAction(result.toolName)).length;
     if (actionCount === 0) return entries.length > event.entries.length ? { entries } : undefined;
     if (event.outcome !== "completed" || !pi.getActiveTools().includes(TOOL_NAME)) {
@@ -88,15 +122,14 @@ export default function (pi: ExtensionAPI) {
     if (!advance(state, actionCount)) {
       return entries.length > event.entries.length ? { entries } : undefined;
     }
-    // A hidden custom message is an extension request, not an actual user input.
-    // PI will transform it into a user-role message for the provider.
-    entries.push({ type: "custom_message", customType: REQUEST_TYPE, content: REQUEST, display: false });
+    entries.push({ type: "custom", customType: CHECK_TYPE, data: { stage: state.stage } });
     awaitingSnapshot = true;
+    injectSnapshotRequest = true;
     return { entries, continue: true };
   });
 
   pi.on("agent_before_settle", () => {
-    // Missing/malformed tool calls should never keep the agent in a sampling loop.
-    awaitingSnapshot = false;
+    // Missing/malformed tool calls or an aborted continuation must not leave a request armed.
+    clearRequest();
   });
 }

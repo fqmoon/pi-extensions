@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { advance, formatSnapshot, freshState, INTERVALS, isAction, REQUEST_TYPE, restoreState, SNAPSHOT_TYPE, TOOL_NAME } from "../state.ts";
+import { advance, formatSnapshot, freshState, INTERVALS, isAction, CHECK_TYPE, REQUEST_TYPE, restoreState, SNAPSHOT_TYPE, TOOL_NAME } from "../state.ts";
 
 test("12 → 8 → 6 → 4 → 4, reset and no recursive snapshot action", () => {
   const state = freshState();
@@ -22,13 +22,14 @@ test("branch replay tracks only current branch and resets at every user message"
   const user = { type: "message", message: { role: "user" } };
   const action = { type: "message", message: { role: "toolResult", toolName: "read" } };
   const snapshotTool = { type: "message", message: { role: "toolResult", toolName: TOOL_NAME } };
-  const request = { type: "custom_message", customType: REQUEST_TYPE };
+  const check = (stage: number) => ({ type: "custom", customType: CHECK_TYPE, data: { stage } });
   const snapshot = { type: "custom_message", customType: SNAPSHOT_TYPE };
-  const branch = [user, ...Array(12).fill(action), request, snapshotTool, snapshot, ...Array(8).fill(action), request, ...Array(6).fill(action), request, ...Array(4).fill(action), request, ...Array(2).fill(action)];
+  const branch = [user, ...Array(12).fill(action), check(1), snapshotTool, snapshot, ...Array(8).fill(action), check(2), ...Array(6).fill(action), check(3), ...Array(4).fill(action), check(3), ...Array(2).fill(action)];
   assert.deepEqual(restoreState(branch as any), { stage: 3, actionsSinceCheck: 2 });
   assert.deepEqual(restoreState([...branch, user] as any), freshState());
-  // Another leaf branched before the first request does not inherit checks on the old leaf.
+  // Another leaf branched before the first check does not inherit checks on the old leaf.
   assert.deepEqual(restoreState([...branch.slice(0, 5), action] as any), { stage: 0, actionsSinceCheck: 5 });
+  assert.deepEqual(restoreState([user, ...Array(12).fill(action), { type: "custom_message", customType: REQUEST_TYPE }] as any), { stage: 1, actionsSinceCheck: 0 });
 });
 
 test("invalid snapshot fields are skipped, not filled in by the extension", () => {

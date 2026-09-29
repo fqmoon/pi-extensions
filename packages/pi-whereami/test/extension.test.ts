@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { registerHooks } from "node:module";
 import { test } from "node:test";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { REQUEST_TYPE, SNAPSHOT_TYPE, TOOL_NAME } from "../state.ts";
+import { CHECK_TYPE, REQUEST_TYPE, SNAPSHOT_TYPE, TOOL_NAME } from "../state.ts";
 
 // The monorepo has an older local PI installation. Resolve pi-ai from the
 // host PI dependency tree for this test; extension imports remain normal.
@@ -15,12 +15,24 @@ try {
 } catch {
   piAi = new URL("../node_modules/@earendil-works/pi-ai/dist/index.js", import.meta.resolve("@earendil-works/pi-coding-agent")).href;
 }
+const hostPiRoot = join(dirname(dirname(process.execPath)), "lib/node_modules/@earendil-works/pi-coding-agent");
+const hostPiAi = pathToFileURL(join(hostPiRoot, "node_modules/@earendil-works/pi-ai/dist/index.js")).href;
 registerHooks({
   resolve(specifier, context, nextResolve) {
-    return nextResolve(specifier === "@earendil-works/pi-ai" ? piAi : specifier, context);
+    if (specifier === "@earendil-works/pi-ai") {
+      return nextResolve(context.parentURL?.startsWith(pathToFileURL(hostPiRoot).href) ? hostPiAi : piAi, context);
+    }
+    return nextResolve(specifier, context);
   },
 });
 const { default: whereami } = await import("../index.ts");
+// The workspace lockfile predates context edits. Exercise the SDK targeted by
+// this extension, falling back to the installed host Pi for this offline test.
+const localPi = import.meta.resolve("@earendil-works/pi-coding-agent");
+const [major, minor] = JSON.parse(readFileSync(new URL("../package.json", localPi), "utf8")).version.split(".").map(Number);
+const modernPi = major > 0 || minor >= 87 ? localPi :
+  pathToFileURL(join(hostPiRoot, "dist/index.js")).href;
+const { SessionManager } = await import(modernPi);
 
 function harness(sessionManager = SessionManager.inMemory("/tmp")) {
   const handlers = new Map<string, Function[]>();
@@ -39,10 +51,24 @@ function harness(sessionManager = SessionManager.inMemory("/tmp")) {
     for (const handler of handlers.get(name) ?? []) result = await handler(event, ctx);
     return result;
   };
-  const boundary = async (toolResults: any[], outcome = "completed") => {
-    const result = await emit("turn_end", { entries: [], toolResults, outcome });
+  const boundary = async (toolResults: any[], outcome = "completed", blocks?: any[]) => {
+    const results = toolResults.map((result, i) => ({
+      ...result, role: "toolResult", toolCallId: result.toolCallId ?? `call-${i}`,
+      content: result.content ?? [{ type: "text", text: "done" }], timestamp: Date.now(),
+    }));
+    const message = {
+      role: "assistant", content: blocks ?? results.map((result) => ({
+        type: "toolCall", id: result.toolCallId, name: result.toolName, arguments: {},
+      })), timestamp: Date.now(), stopReason: outcome === "completed" ? "toolUse" : outcome,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+    };
+    const messageEntryId = sessionManager.appendMessage(message);
+    const toolResultEntryIds = results.map((result) => sessionManager.appendMessage(result));
+    const result = await emit("turn_end", { entries: [], message, toolResults: results, toolResultEntryIds, messageEntryId, outcome });
     for (const entry of result?.entries ?? []) {
       if (entry.type === "custom_message") sessionManager.appendCustomMessageEntry(entry.customType, entry.content, entry.display);
+      if (entry.type === "custom") sessionManager.appendCustomEntry(entry.customType, entry.data);
+      if (entry.type === "context_edit") sessionManager.appendContextEdit(entry.targetId, entry.replacement);
     }
     return result;
   };
@@ -57,18 +83,86 @@ test("tool batch requests one check; main model tool writes exactly one custom s
   assert.equal(await h.boundary(h.actions(11)), undefined);
   const triggered = await h.boundary(h.actions(1));
   assert.equal(triggered.continue, true);
-  assert.equal(triggered.entries[0].customType, REQUEST_TYPE);
-  assert.equal(triggered.entries[0].display, false);
+  assert.equal(triggered.entries[0].customType, CHECK_TYPE);
+  assert.deepEqual(triggered.entries[0].data, { stage: 1 });
+  assert.equal(h.ctx.sessionManager.getBranch().some((entry: any) => entry.customType === REQUEST_TYPE), false);
+  const context = [{ role: "user", content: "real task", timestamp: 1 }];
+  const requested = await h.emit("context", { messages: context });
+  assert.match(requested.messages.at(-1).content, /whereami_snapshot/);
+  assert.deepEqual((await h.emit("context", { messages: context }))?.messages, undefined);
   const response = await h.tool.execute("check-1", { level: "module", scope: "renderer", state: "dirty propagation is likely", next: "inspect invalidation" });
   const after = await h.boundary([{ role: "toolResult", toolCallId: "check-1", toolName: TOOL_NAME, isError: false, details: response.details }]);
-  assert.equal(after.entries[0].customType, SNAPSHOT_TYPE);
-  assert.equal(after.entries[0].display, true);
+  assert.deepEqual(after.entries.map((entry: any) => entry.type), ["context_edit", "context_edit", "custom_message"]);
+  assert.equal(after.entries[2].customType, SNAPSHOT_TYPE);
+  assert.equal(after.entries[2].display, true);
   assert.equal(after.continue, undefined); // Normal tool-follow-up, not a forced steering turn.
   const branch = h.ctx.sessionManager.getBranch();
   assert.equal(branch.filter((entry: any) => entry.customType === SNAPSHOT_TYPE).length, 1);
-  assert.equal(h.ctx.sessionManager.buildSessionContext().messages.at(-1)?.role, "custom");
+  assert.equal(branch.filter((entry: any) => entry.type === "context_edit").length, 2);
+  assert.equal(branch.some((entry: any) => entry.type === "message" && entry.message.role === "assistant" &&
+    entry.message.content.some((part: any) => part.name === TOOL_NAME)), true);
+  assert.equal(branch.some((entry: any) => entry.type === "message" && entry.message.role === "toolResult" &&
+    entry.message.toolName === TOOL_NAME), true);
+  const projected = h.ctx.sessionManager.buildSessionContext().messages;
+  assert.equal(projected.at(-1)?.role, "custom");
+  assert.match(JSON.stringify(projected.at(-1)), /\[whereami\]/);
+  assert.equal(projected.some((message: any) => message.role === "toolResult" && message.toolName === TOOL_NAME), false);
+  assert.equal(projected.some((message: any) => message.role === "assistant" && message.content?.some((part: any) => part.name === TOOL_NAME)), false);
+  assert.equal(projected.some((message: any) => JSON.stringify(message).includes("Briefly describe your current position")), false);
   assert.equal(await h.boundary(h.actions(7)), undefined);
   assert.equal((await h.boundary(h.actions(1)))?.continue, true); // next interval is 8
+});
+
+test("mixed snapshot and task tool calls retain the whole task turn in context", async () => {
+  const h = harness();
+  await h.emit("session_start");
+  assert.equal((await h.boundary(h.actions(12)))?.continue, true);
+  await h.emit("context", { messages: [] });
+  const recorded = await h.tool.execute("sample", { level: "module", scope: "renderer", state: "dirty tracking", next: "inspect" });
+  const after = await h.boundary([
+    { toolName: TOOL_NAME, toolCallId: "sample", isError: false, details: recorded.details },
+    { toolName: "read", toolCallId: "task", isError: false },
+  ]);
+  assert.deepEqual(after.entries.map((entry: any) => entry.type), ["custom_message"]);
+  const context = h.ctx.sessionManager.buildSessionContext().messages;
+  assert.equal(context.some((message: any) => message.role === "assistant" && message.content.some((part: any) => part.name === "read")), true);
+  assert.equal(context.some((message: any) => message.role === "toolResult" && message.toolName === "read"), true);
+  assert.equal(context.at(-1)?.role, "custom");
+});
+
+test("assistant text or unresolved result IDs prevent unsafe cleanup", async () => {
+  const h = harness();
+  await h.emit("session_start");
+  await h.boundary(h.actions(12));
+  const recorded = await h.tool.execute("sample", { level: "module", scope: "renderer", state: "dirty tracking", next: "inspect" });
+  const result = { role: "toolResult", toolName: TOOL_NAME, toolCallId: "sample", isError: false, details: recorded.details };
+  const after = await h.boundary([result], "completed", [
+    { type: "text", text: "Task progress" },
+    { type: "toolCall", name: TOOL_NAME, id: "sample", arguments: {} },
+  ]);
+  assert.deepEqual(after.entries.map((entry: any) => entry.type), ["custom_message"]);
+  await h.boundary(h.actions(8));
+  const noIds = await h.emit("turn_end", {
+    entries: [], outcome: "completed", toolResults: [result], messageEntryId: "missing", toolResultEntryIds: [],
+    message: { role: "assistant", content: [{ type: "toolCall", name: TOOL_NAME, id: "sample", arguments: {} }] },
+  });
+  assert.deepEqual(noIds.entries.map((entry: any) => entry.type), ["custom_message"]);
+});
+
+test("required fields and invalid or interrupted checks never force a retry", async () => {
+  const h = harness();
+  assert.deepEqual(h.tool.parameters.required?.sort(), ["level", "next", "scope", "state"]);
+  await h.emit("session_start");
+  assert.equal((await h.boundary(h.actions(12)))?.continue, true);
+  const malformed = await h.tool.execute("bad", { level: "module", scope: "renderer", state: "x\ny", next: "inspect" });
+  assert.equal(malformed.details.snapshot, undefined);
+  assert.equal(await h.boundary([{ toolName: TOOL_NAME, toolCallId: "bad", details: malformed.details }]), undefined);
+  assert.equal(h.ctx.sessionManager.getBranch().some((entry: any) => entry.customType === SNAPSHOT_TYPE), false);
+  assert.equal((await h.emit("context", { messages: [] }))?.messages, undefined);
+  assert.equal((await h.boundary(h.actions(8)))?.continue, true);
+  await h.emit("agent_before_settle");
+  assert.equal((await h.emit("context", { messages: [] }))?.messages, undefined);
+  assert.equal(await h.boundary([]), undefined);
 });
 
 test("bad fields and failed checks do not interrupt the task; user resets at deep stage", async () => {
@@ -117,6 +211,41 @@ test("an older session's tool loadout activates the plugin; later unavailability
   assert.equal(await h.boundary(h.actions(12)), undefined);
   h.setToolAvailable(true);
   assert.equal((await h.boundary(h.actions(1)))?.continue, true);
+});
+
+test("resuming a session keeps checkpoint and context edits on their own branch", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-whereami-cleanup-"));
+  try {
+    const manager = SessionManager.create(dir, dir);
+    const h = harness(manager);
+    await h.emit("session_start");
+    manager.appendMessage({ role: "user", content: [{ type: "text", text: "task" }], timestamp: Date.now() });
+    assert.equal((await h.boundary(h.actions(12)))?.continue, true);
+    await h.emit("context", { messages: [] });
+    const anchor = manager.getLeafId();
+    const recorded = await h.tool.execute("sample", { level: "module", scope: "renderer", state: "dirty tracking", next: "inspect" });
+    await h.boundary([{ toolName: TOOL_NAME, toolCallId: "sample", details: recorded.details }]);
+    const path = manager.getSessionFile()!;
+    const resumed = SessionManager.open(path);
+    assert.equal(resumed.getBranch().filter((entry: any) => entry.type === "context_edit").length, 2);
+    assert.equal(resumed.getBranch().filter((entry: any) => entry.customType === CHECK_TYPE).length, 1);
+    const messages = resumed.buildSessionContext().messages;
+    assert.equal(messages.some((msg: any) => msg.role === "assistant" && msg.content.some((part: any) => part.name === TOOL_NAME)), false);
+    assert.equal(messages.some((msg: any) => msg.role === "toolResult" && msg.toolName === TOOL_NAME), false);
+    assert.equal(messages.at(-1)?.role, "custom");
+    const resumedHarness = harness(resumed);
+    await resumedHarness.emit("session_start");
+    assert.equal(await resumedHarness.boundary(resumedHarness.actions(7)), undefined);
+    assert.equal((await resumedHarness.boundary(resumedHarness.actions(1)))?.continue, true);
+    resumed.branch(anchor);
+    const sibling = harness(resumed);
+    await sibling.emit("session_tree");
+    assert.equal(resumed.getBranch().some((entry: any) => entry.customType === SNAPSHOT_TYPE), false);
+    assert.equal(resumed.getBranch().some((entry: any) => entry.type === "context_edit"), false);
+    assert.equal((await sibling.boundary(sibling.actions(8)))?.continue, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("session file resume and branch keep the snapshot in history without polluting sibling branches", () => {

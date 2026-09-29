@@ -1,7 +1,8 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 
 export const INTERVALS = [12, 8, 6, 4] as const;
-export const REQUEST_TYPE = "pi-whereami-request";
+export const REQUEST_TYPE = "pi-whereami-request"; // Legacy sessions only.
+export const CHECK_TYPE = "pi-whereami-check";
 export const SNAPSHOT_TYPE = "pi-whereami";
 export const TOOL_NAME = "whereami_snapshot";
 
@@ -46,8 +47,15 @@ export function restoreState(branch: readonly SessionEntry[]): TriggerState {
     if (entry.type === "message" && entry.message.role === "user") {
       state.stage = 0;
       state.actionsSinceCheck = 0;
+    } else if (entry.type === "custom" && entry.customType === CHECK_TYPE &&
+      typeof (entry.data as { stage?: unknown } | undefined)?.stage === "number" &&
+      Number.isInteger((entry.data as { stage: number }).stage) &&
+      (entry.data as { stage: number }).stage >= 0 && (entry.data as { stage: number }).stage < INTERVALS.length) {
+      // A check consumes the interval even when no valid snapshot follows.
+      state.stage = (entry.data as { stage: number }).stage;
+      state.actionsSinceCheck = 0;
     } else if (entry.type === "custom_message" && entry.customType === REQUEST_TYPE) {
-      // A request consumes the interval whether or not the model produced a valid snapshot.
+      // Older sessions persisted requests instead of non-context checkpoints.
       state.stage = Math.min(state.stage + 1, INTERVALS.length - 1);
       state.actionsSinceCheck = 0;
     } else if (entry.type === "message" && entry.message.role === "toolResult" && isAction(entry.message.toolName)) {
