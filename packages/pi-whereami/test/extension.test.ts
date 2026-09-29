@@ -95,7 +95,11 @@ async function injectedPrompt(h: ReturnType<typeof harness>): Promise<string> {
 test("missing reorient.md uses the built-in strategy and fixed protocol", async () => {
   const prompt = await injectedPrompt(harness());
   assert.match(prompt, /Re-orient before continuing/);
-  assert.match(prompt, /informative, or are you following local adjacency/);
+  assert.match(prompt, /What is the main uncertainty or hypothesis currently driving the work\?/);
+  assert.match(prompt, /Has the recent work materially reduced that uncertainty or changed your understanding\?/);
+  assert.match(prompt, /continuing mainly from momentum, local adjacency, or an outdated assumption\?/);
+  assert.match(prompt, /would resolve the important uncertainty more directly, prefer it\./);
+  assert.match(prompt, /If the current path remains the best path, keep it\./);
   assert.match(prompt, /call whereami_snapshot exactly once/);
   assert.match(prompt, /Level .* Scope, State, Next/);
 });

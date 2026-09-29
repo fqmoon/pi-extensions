@@ -17,11 +17,12 @@ const DEFAULT_REORIENTATION_PROMPT = `Re-orient before continuing.
 
 Review your current position in the task:
 - What abstraction level and scope are you operating in?
-- Has the recent work materially changed your understanding?
-- Is the current path still informative, or are you following local adjacency?
-- Would another level, competing hypothesis, or evidence source provide more information?
+- What is the main uncertainty or hypothesis currently driving the work?
+- Has the recent work materially reduced that uncertainty or changed your understanding?
+- Is the current path still the most informative way forward, or is it continuing mainly from momentum, local adjacency, or an outdated assumption?
+- If a different abstraction level, competing hypothesis, or evidence source would resolve the important uncertainty more directly, prefer it.
 
-If the current path remains best, keep it.
+If the current path remains the best path, keep it.
 Do not change direction merely because this check occurred.`;
 
 const SNAPSHOT_PROTOCOL = `After re-orienting, call ${TOOL_NAME} exactly once.
