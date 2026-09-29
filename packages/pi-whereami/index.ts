@@ -1,5 +1,7 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   advance,
   formatSnapshot,
@@ -11,12 +13,34 @@ import {
   TOOL_NAME,
 } from "./state.ts";
 
-const REQUEST = `Briefly describe your current position in the task by calling ${TOOL_NAME} once.
+const DEFAULT_REORIENTATION_PROMPT = `Re-orient before continuing.
+
+Review your current position in the task:
+- What abstraction level and scope are you operating in?
+- Has the recent work materially changed your understanding?
+- Is the current path still informative, or are you following local adjacency?
+- Would another level, competing hypothesis, or evidence source provide more information?
+
+If the current path remains best, keep it.
+Do not change direction merely because this check occurred.`;
+
+const SNAPSHOT_PROTOCOL = `After re-orienting, call ${TOOL_NAME} exactly once.
+Record the position you now hold, not your reasoning process.
 Use one short sentence per field: Level (repo/subsystem/module/call-chain/file/symbol), Scope, State, Next.
-Describe the state you already hold; do not make a new plan or change direction because of this check.
-Do not include a separate progress report. Continue the original task after the snapshot.`;
+Do not report the re-orientation analysis separately. Continue the original task after the snapshot.`;
+
+function loadReorientationPrompt(): string {
+  try {
+    const prompt = readFileSync(join(getAgentDir(), "whereami", "reorient.md"), "utf8");
+    if (prompt.trim()) return prompt;
+  } catch {
+    // Missing or unreadable configuration must not interrupt the agent.
+  }
+  return DEFAULT_REORIENTATION_PROMPT;
+}
 
 export default function (pi: ExtensionAPI) {
+  const request = `${loadReorientationPrompt().trimEnd()}\n\n${SNAPSHOT_PROTOCOL}`;
   let state = freshState();
   let awaitingSnapshot = false;
   let injectSnapshotRequest = false;
@@ -52,7 +76,7 @@ export default function (pi: ExtensionAPI) {
     if (!injectSnapshotRequest) return;
     injectSnapshotRequest = false;
     return {
-      messages: [...event.messages, { role: "user", content: REQUEST, timestamp: Date.now() }],
+      messages: [...event.messages, { role: "user", content: request, timestamp: Date.now() }],
     };
   });
 

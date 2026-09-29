@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { registerHooks } from "node:module";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { CHECK_TYPE, REQUEST_TYPE, SNAPSHOT_TYPE, TOOL_NAME } from "../state.ts";
 
 // The monorepo has an older local PI installation. Resolve pi-ai from the
@@ -33,18 +33,27 @@ const [major, minor] = JSON.parse(readFileSync(new URL("../package.json", localP
 const modernPi = major > 0 || minor >= 87 ? localPi :
   pathToFileURL(join(hostPiRoot, "dist/index.js")).href;
 const { SessionManager } = await import(modernPi);
+const defaultAgentDir = mkdtempSync(join(tmpdir(), "pi-whereami-config-"));
+after(() => rmSync(defaultAgentDir, { recursive: true, force: true }));
 
-function harness(sessionManager = SessionManager.inMemory("/tmp")) {
+function harness(sessionManager = SessionManager.inMemory("/tmp"), agentDir = defaultAgentDir) {
   const handlers = new Map<string, Function[]>();
   let tool: any;
   let toolAvailable = true;
   let pendingMessages = false;
-  whereami({
-    on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
-    registerTool(definition: unknown) { tool = definition; },
-    getActiveTools() { return toolAvailable ? [TOOL_NAME] : []; },
-    setActiveTools(names: string[]) { toolAvailable = names.includes(TOOL_NAME); },
-  } as any);
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    whereami({
+      on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
+      registerTool(definition: unknown) { tool = definition; },
+      getActiveTools() { return toolAvailable ? [TOOL_NAME] : []; },
+      setActiveTools(names: string[]) { toolAvailable = names.includes(TOOL_NAME); },
+    } as any);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
   const ctx = { sessionManager, model: { id: "test-model" }, hasPendingMessages: () => pendingMessages };
   const emit = async (name: string, event: any = {}) => {
     let result;
@@ -76,6 +85,59 @@ function harness(sessionManager = SessionManager.inMemory("/tmp")) {
   return { ctx, emit, boundary, actions, setToolAvailable(available: boolean) { toolAvailable = available; }, setPendingMessages(pending: boolean) { pendingMessages = pending; }, get tool() { return tool; } };
 }
 
+async function injectedPrompt(h: ReturnType<typeof harness>): Promise<string> {
+  await h.emit("session_start");
+  assert.equal((await h.boundary(h.actions(12)))?.continue, true);
+  const request = await h.emit("context", { messages: [] });
+  return request.messages.at(-1).content;
+}
+
+test("missing reorient.md uses the built-in strategy and fixed protocol", async () => {
+  const prompt = await injectedPrompt(harness());
+  assert.match(prompt, /Re-orient before continuing/);
+  assert.match(prompt, /informative, or are you following local adjacency/);
+  assert.match(prompt, /call whereami_snapshot exactly once/);
+  assert.match(prompt, /Level .* Scope, State, Next/);
+});
+
+test("user strategy replaces the default, retains the protocol, and is loaded once per extension", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-whereami-user-prompt-"));
+  try {
+    const file = join(dir, "whereami", "reorient.md");
+    mkdirSync(dirname(file));
+    writeFileSync(file, "CUSTOM REORIENT");
+    const h = harness(undefined, dir);
+    writeFileSync(file, "Do whatever you want.");
+    const prompt = await injectedPrompt(h);
+    assert.match(prompt, /CUSTOM REORIENT/);
+    assert.doesNotMatch(prompt, /Re-orient before continuing/);
+    assert.match(prompt, /call whereami_snapshot exactly once/);
+    assert.match(prompt, /Level .* Scope, State, Next/);
+    assert.equal(JSON.stringify(h.ctx.sessionManager.getBranch()).includes("CUSTOM REORIENT"), false);
+    assert.equal((await h.emit("context", { messages: [] }))?.messages, undefined);
+    const replaced = await injectedPrompt(harness(undefined, dir));
+    assert.match(replaced, /Do whatever you want/);
+    assert.match(replaced, /call whereami_snapshot exactly once/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("blank or unreadable reorient.md falls back without failing the agent", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-whereami-fallback-"));
+  try {
+    const file = join(dir, "whereami", "reorient.md");
+    mkdirSync(dirname(file));
+    writeFileSync(file, " \n\t ");
+    assert.match(await injectedPrompt(harness(undefined, dir)), /Re-orient before continuing/);
+    rmSync(file);
+    mkdirSync(file); // Reading a directory as a file fails even when tests run as root.
+    assert.match(await injectedPrompt(harness(undefined, dir)), /Re-orient before continuing/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("tool batch requests one check; main model tool writes exactly one custom snapshot and keeps working", async () => {
   const h = harness();
   await h.emit("session_start");
@@ -88,6 +150,7 @@ test("tool batch requests one check; main model tool writes exactly one custom s
   assert.equal(h.ctx.sessionManager.getBranch().some((entry: any) => entry.customType === REQUEST_TYPE), false);
   const context = [{ role: "user", content: "real task", timestamp: 1 }];
   const requested = await h.emit("context", { messages: context });
+  assert.match(requested.messages.at(-1).content, /Re-orient before continuing/);
   assert.match(requested.messages.at(-1).content, /whereami_snapshot/);
   assert.deepEqual((await h.emit("context", { messages: context }))?.messages, undefined);
   const response = await h.tool.execute("check-1", { level: "module", scope: "renderer", state: "dirty propagation is likely", next: "inspect invalidation" });
@@ -108,7 +171,9 @@ test("tool batch requests one check; main model tool writes exactly one custom s
   assert.match(JSON.stringify(projected.at(-1)), /\[whereami\]/);
   assert.equal(projected.some((message: any) => message.role === "toolResult" && message.toolName === TOOL_NAME), false);
   assert.equal(projected.some((message: any) => message.role === "assistant" && message.content?.some((part: any) => part.name === TOOL_NAME)), false);
-  assert.equal(projected.some((message: any) => JSON.stringify(message).includes("Briefly describe your current position")), false);
+  assert.equal(JSON.stringify(branch).includes("Re-orient before continuing"), false);
+  assert.equal(JSON.stringify(projected).includes("Re-orient before continuing"), false);
+  assert.equal((await h.emit("context", { messages: projected }))?.messages, undefined);
   assert.equal(await h.boundary(h.actions(7)), undefined);
   assert.equal((await h.boundary(h.actions(1)))?.continue, true); // next interval is 8
 });
