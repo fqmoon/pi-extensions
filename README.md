@@ -29,3 +29,9 @@ Location: [`packages/pi-knowledge-profile`](./packages/pi-knowledge-profile)
 ```text
 /knowledge-sync
 ```
+
+### whereami
+
+Automatically records brief position snapshots during long autonomous runs (12, then 8, 6, 4… task tool calls after each user message).
+
+Location: [`packages/pi-whereami`](./packages/pi-whereami). Requires PI 0.87.1 or newer; no settings or commands.

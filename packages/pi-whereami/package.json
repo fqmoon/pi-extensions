@@ -1,0 +1,22 @@
+{
+  "name": "pi-whereami",
+  "version": "0.1.0",
+  "description": "Short, periodic agent position snapshots in Pi session history.",
+  "type": "module",
+  "files": ["index.ts", "state.ts", "README.md", "LICENSE"],
+  "keywords": ["pi", "pi-agent", "pi-extension", "pi-package"],
+  "author": "fqmoon",
+  "license": "MIT",
+  "homepage": "https://github.com/fqmoon/pi-extensions/tree/main/packages/pi-whereami#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fqmoon/pi-extensions.git",
+    "directory": "packages/pi-whereami"
+  },
+  "publishConfig": { "access": "public" },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.87.1",
+    "@earendil-works/pi-coding-agent": ">=0.87.1"
+  },
+  "pi": { "extensions": ["./index.ts"] }
+}
