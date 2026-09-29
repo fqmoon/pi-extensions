@@ -26,13 +26,14 @@ function harness(sessionManager = SessionManager.inMemory("/tmp")) {
   const handlers = new Map<string, Function[]>();
   let tool: any;
   let toolAvailable = true;
+  let pendingMessages = false;
   whereami({
     on(name: string, handler: Function) { handlers.set(name, [...(handlers.get(name) ?? []), handler]); },
     registerTool(definition: unknown) { tool = definition; },
     getActiveTools() { return toolAvailable ? [TOOL_NAME] : []; },
     setActiveTools(names: string[]) { toolAvailable = names.includes(TOOL_NAME); },
   } as any);
-  const ctx = { sessionManager, model: { id: "test-model" } };
+  const ctx = { sessionManager, model: { id: "test-model" }, hasPendingMessages: () => pendingMessages };
   const emit = async (name: string, event: any = {}) => {
     let result;
     for (const handler of handlers.get(name) ?? []) result = await handler(event, ctx);
@@ -46,7 +47,7 @@ function harness(sessionManager = SessionManager.inMemory("/tmp")) {
     return result;
   };
   const actions = (n: number) => Array.from({ length: n }, (_, i) => ({ role: "toolResult", toolName: "read", toolCallId: `id-${i}`, isError: false }));
-  return { ctx, emit, boundary, actions, setToolAvailable(available: boolean) { toolAvailable = available; }, get tool() { return tool; } };
+  return { ctx, emit, boundary, actions, setToolAvailable(available: boolean) { toolAvailable = available; }, setPendingMessages(pending: boolean) { pendingMessages = pending; }, get tool() { return tool; } };
 }
 
 test("tool batch requests one check; main model tool writes exactly one custom snapshot and keeps working", async () => {
@@ -82,12 +83,21 @@ test("bad fields and failed checks do not interrupt the task; user resets at dee
   // A failed sampling turn (no tool called) is allowed to finish normally.
   assert.equal((await h.boundary(h.actions(4)))?.continue, true);
   assert.equal(await h.boundary([]), undefined);
-  await h.emit("input", { source: "interactive", text: "new direction" });
+  h.setPendingMessages(true);
   assert.equal(await h.boundary(h.actions(12)), undefined); // old run, before queued input is delivered
+  h.setPendingMessages(false);
   await h.emit("message_start", { message: { role: "user" } });
   assert.equal(await h.boundary(h.actions(11)), undefined);
   await h.emit("message_start", { message: { role: "custom" } });
   assert.equal((await h.boundary(h.actions(1)))?.continue, true); // custom is not a reset
+});
+
+test("handled input does not suppress checks or reset the counting interval", async () => {
+  const h = harness();
+  await h.emit("session_start");
+  assert.equal(await h.boundary(h.actions(11)), undefined);
+  await h.emit("input", { source: "interactive", text: ":status" }); // another extension handles it
+  assert.equal((await h.boundary(h.actions(1)))?.continue, true);
 });
 
 test("error turns do not force sampling, but their task tool calls still count", async () => {

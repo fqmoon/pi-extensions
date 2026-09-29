@@ -19,7 +19,6 @@ Do not include a separate progress report. Continue the original task after the 
 export default function (pi: ExtensionAPI) {
   let state = freshState();
   let awaitingSnapshot = false;
-  let waitingForUserDelivery = false;
 
   const reset = () => {
     state = freshState();
@@ -29,7 +28,6 @@ export default function (pi: ExtensionAPI) {
     state = restoreState(branch);
     // An interrupted request must not become a new autonomous run on resume.
     awaitingSnapshot = false;
-    waitingForUserDelivery = false;
   };
 
   const onSessionPath = (branch: Parameters<typeof restoreState>[0]) => {
@@ -40,20 +38,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => onSessionPath(ctx.sessionManager.getBranch()));
   pi.on("session_tree", (_event, ctx) => onSessionPath(ctx.sessionManager.getBranch()));
 
-  // Reset on submission even if the user queues input while the agent is working.
-  // message_start also covers messages arriving from another extension or a queued prompt.
-  pi.on("input", (event) => {
-    if (event.source !== "extension") {
-      reset();
-      // Old-run tools may still complete before a queued message is delivered.
-      waitingForUserDelivery = true;
-    }
-  });
+  // Only a delivered user message starts a new counting interval.
   pi.on("message_start", (event) => {
-    if (event.message.role === "user") {
-      reset();
-      waitingForUserDelivery = false;
-    }
+    if (event.message.role === "user") reset();
   });
 
   pi.registerTool({
@@ -75,10 +62,9 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.on("turn_end", (event) => {
-    // A queued user input supersedes the old autonomous run immediately, even
-    // when its next tool batch finishes before PI delivers the new user message.
-    if (waitingForUserDelivery) return;
+  pi.on("turn_end", (event, ctx) => {
+    // Do not sample the old run while a new message is queued for delivery.
+    if (ctx.hasPendingMessages()) return;
     // The boundary runs after the entire tool batch has been persisted. Never insert
     // a custom message between a tool call and its result (invalid on replay).
     const entries = [...event.entries];
