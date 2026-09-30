@@ -1,6 +1,6 @@
 # pi-whereami
 
-A Pi extension that periodically asks the **current agent** to re-orient and record a brief position snapshot during long autonomous runs. No second model, automatic drift detection, forced direction change, settings UI, or panel.
+A Pi extension that periodically asks the **current agent** to re-orient and record a brief position snapshot during long autonomous runs. A compact HUD above the editor keeps the latest position visible while the same snapshots continue to appear in conversation history. No second model, automatic drift detection, forced direction change, or settings UI.
 
 Requires `@earendil-works/pi-coding-agent` 0.87.1 or newer. Install the package with Pi or load `index.ts` directly. This monorepo loads it via the root `pi.extensions` manifest.
 
@@ -18,6 +18,10 @@ Scope: rendering pipeline
 State: invalidation remains the likely issue
 Next: inspect the dirty propagation boundary
 ```
+
+In interactive mode, the HUD shows Level / Scope / State / Next from that same snapshot. Before any snapshot exists, it shows `Awaiting first snapshot · Decisions 0/12`, updating the decision progress at each turn boundary. When a real user message starts a new interval, it shows `Awaiting current snapshot · Decisions 0/12` and retains the old fields as muted `History` until a new valid snapshot arrives. During collection it shows `Updating snapshot`. It never invents an initial position or requests an extra model response to populate the panel.
+
+The HUD restores from the active session branch on resume or tree navigation and clears on session shutdown/reload. Malformed snapshots leave the last valid position intact. Headless modes skip the widget, and a UI failure cannot interfere with trigger bookkeeping or message persistence. The HUD is a view of periodic snapshots rather than a real-time tool/activity tracker; existing trigger intervals and history/context behavior are unchanged.
 
 To replace the built-in re-orientation strategy, create `<agent-dir>/whereami/reorient.md` (by default `~/.pi/agent/whereami/reorient.md`; `PI_CODING_AGENT_DIR` overrides `<agent-dir>`). A missing, blank, or unreadable file falls back to the built-in strategy. The file is read once when the extension loads; changing it requires reloading the extension. Its content **replaces** the default strategy, but the plugin always appends its own snapshot instructions, including the fixed Level / Scope / State / Next fields and a request not to report the analysis separately. There is no project-specific prompt hierarchy or live file watching.
 

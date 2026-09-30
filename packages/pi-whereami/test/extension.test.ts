@@ -36,11 +36,13 @@ const { SessionManager } = await import(modernPi);
 const defaultAgentDir = mkdtempSync(join(tmpdir(), "pi-whereami-config-"));
 after(() => rmSync(defaultAgentDir, { recursive: true, force: true }));
 
-function harness(sessionManager = SessionManager.inMemory("/tmp"), agentDir = defaultAgentDir) {
+function harness(sessionManager = SessionManager.inMemory("/tmp"), agentDir = defaultAgentDir, hasUI = true) {
   const handlers = new Map<string, Function[]>();
   let tool: any;
   let toolAvailable = true;
   let pendingMessages = false;
+  let widgetError = false;
+  const widgets = new Map<string, { content: string[]; placement: string }>();
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
   try {
@@ -54,7 +56,17 @@ function harness(sessionManager = SessionManager.inMemory("/tmp"), agentDir = de
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   }
-  const ctx = { sessionManager, model: { id: "test-model" }, hasPendingMessages: () => pendingMessages };
+  const ctx = {
+    sessionManager, model: { id: "test-model" }, hasPendingMessages: () => pendingMessages, hasUI,
+    ui: {
+      theme: { fg: (_color: string, text: string) => text },
+      setWidget(key: string, content: string[] | undefined, options: { placement: string }) {
+        if (widgetError) throw new Error("widget unavailable");
+        if (content) widgets.set(key, { content, placement: options.placement });
+        else widgets.delete(key);
+      },
+    },
+  };
   const emit = async (name: string, event: any = {}) => {
     let result;
     for (const handler of handlers.get(name) ?? []) result = await handler(event, ctx);
@@ -90,8 +102,92 @@ function harness(sessionManager = SessionManager.inMemory("/tmp"), agentDir = de
     }
     return result;
   };
-  return { ctx, emit, boundary, actions, decisions, setToolAvailable(available: boolean) { toolAvailable = available; }, setPendingMessages(pending: boolean) { pendingMessages = pending; }, get tool() { return tool; } };
+  return { ctx, emit, boundary, actions, decisions, widgets, setWidgetError(error: boolean) { widgetError = error; }, setToolAvailable(available: boolean) { toolAvailable = available; }, setPendingMessages(pending: boolean) { pendingMessages = pending; }, get tool() { return tool; } };
 }
+
+async function collectSnapshot(h: ReturnType<typeof harness>, scope = "renderer") {
+  await h.emit("context", { messages: [] });
+  const recorded = await h.tool.execute("hud-sample", { level: "module", scope, state: "dirty propagation is likely", next: "inspect invalidation" });
+  return h.boundary([{ toolName: TOOL_NAME, toolCallId: "hud-sample", isError: false, details: recorded.details }]);
+}
+
+test("HUD appears above the editor and reuses the durable snapshot without adding history", async () => {
+  const h = harness();
+  await h.emit("session_start");
+  assert.deepEqual(h.widgets.get("pi-whereami"), { content: ["whereami · Awaiting first snapshot · Decisions 0/12"], placement: "aboveEditor" });
+  assert.equal(h.ctx.sessionManager.getBranch().length, 0);
+  await h.decisions(3);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions 3\/12/);
+  await h.decisions(9);
+  assert.deepEqual(h.widgets.get("pi-whereami")?.content, ["whereami · Updating snapshot"]);
+  await collectSnapshot(h);
+  assert.deepEqual(h.widgets.get("pi-whereami")?.content, [
+    "whereami · Latest snapshot", "Level: module · Scope: renderer",
+    "State: dirty propagation is likely", "Next: inspect invalidation",
+  ]);
+  const snapshots = () => h.ctx.sessionManager.getBranch().filter((entry: any) => entry.customType === SNAPSHOT_TYPE);
+  assert.equal(snapshots().length, 1);
+  assert.equal(snapshots()[0].content, "[whereami]\n\nLevel: module\nScope: renderer\nState: dirty propagation is likely\nNext: inspect invalidation");
+  assert.equal(JSON.stringify(h.ctx.sessionManager.buildSessionContext().messages).includes("Latest snapshot"), false);
+  await h.decisions(8);
+  await collectSnapshot(h, "pipeline");
+  assert.equal(h.widgets.size, 1);
+  assert.match(h.widgets.get("pi-whereami")!.content[1], /Scope: pipeline/);
+  assert.equal(snapshots().length, 2); // History still appends; only the panel replaces.
+});
+
+test("HUD labels a previous input snapshot until a new successful snapshot arrives", async () => {
+  const h = harness();
+  await h.emit("session_start");
+  await h.decisions(12);
+  await collectSnapshot(h);
+  await h.emit("message_start", { message: { role: "custom" } });
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Latest snapshot/);
+  await h.emit("message_start", { message: { role: "user" } });
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Awaiting current snapshot · Decisions 0\/12/);
+  assert.match(h.widgets.get("pi-whereami")!.content[1], /^History/);
+  await h.decisions(12);
+  const malformed = await h.tool.execute("bad-hud", { level: "module" });
+  await h.boundary([{ toolName: TOOL_NAME, details: malformed.details }]);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Awaiting current snapshot · Decisions 0\/8/);
+  await h.decisions(8);
+  await collectSnapshot(h, "new task");
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Latest snapshot/);
+  assert.match(h.widgets.get("pi-whereami")!.content[1], /Scope: new task/);
+});
+
+test("HUD restores the active branch and clears when switching to a path without snapshots", async () => {
+  const h = harness();
+  await h.emit("session_start");
+  await h.decisions(12);
+  const beforeSnapshot = h.ctx.sessionManager.getLeafId();
+  await collectSnapshot(h);
+  const user = { role: "user", content: [{ type: "text", text: "next task" }], timestamp: Date.now() };
+  h.ctx.sessionManager.appendMessage(user);
+  const resumed = harness(h.ctx.sessionManager);
+  await resumed.emit("session_start");
+  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Awaiting current snapshot/);
+  assert.match(resumed.widgets.get("pi-whereami")!.content[1], /Scope: renderer/);
+  h.ctx.sessionManager.branch(beforeSnapshot);
+  await resumed.emit("session_tree");
+  assert.deepEqual(resumed.widgets.get("pi-whereami")?.content, ["whereami · Awaiting first snapshot · Decisions 0/8"]);
+  await resumed.emit("session_shutdown");
+  assert.equal(resumed.widgets.size, 0);
+});
+
+test("headless mode and widget failures preserve the trigger and snapshot behavior", async () => {
+  for (const hasUI of [false, true]) {
+    const h = harness(undefined, undefined, hasUI);
+    h.setWidgetError(true);
+    await h.emit("session_start");
+    assert.equal((await h.decisions(12))?.continue, true);
+    const result = await collectSnapshot(h);
+    assert.equal(result.entries.at(-1).customType, SNAPSHOT_TYPE);
+    assert.equal(h.ctx.sessionManager.getBranch().filter((entry: any) => entry.customType === SNAPSHOT_TYPE).length, 1);
+    assert.equal(h.widgets.size, 0);
+    await h.emit("session_shutdown");
+  }
+});
 
 async function injectedPrompt(h: ReturnType<typeof harness>): Promise<string> {
   await h.emit("session_start");
