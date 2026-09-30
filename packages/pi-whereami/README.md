@@ -32,10 +32,28 @@ whereami · Decisions: 13/20 · Checkpoints: 1 · Checkpoint at decision 12
 The default check intervals gradually shorten:
 
 ```text
-12 → 8 → 6 → 4 → 4 → ...
+20 → 15 → 10 → 10 → ...
 ```
 
 Each new user message resets the count.
+
+## Configuration
+
+To change the schedule, create:
+
+```text
+~/.pi/agent/whereami/config.json
+```
+
+For example:
+
+```json
+{
+  "intervals": [30, 20, 10]
+}
+```
+
+`intervals` must contain **1 to 8 positive integers**. The last value repeats indefinitely, so `[30, 20, 10]` means `30 → 20 → 10 → 10 → ...`. Missing or invalid configuration falls back to the default `[20, 15, 10]`. Run `/reload` after editing the file.
 
 It does not supervise the agent or decide whether the agent is correct. It simply interrupts a long chain of decisions often enough to make the agent look back and ask:
 

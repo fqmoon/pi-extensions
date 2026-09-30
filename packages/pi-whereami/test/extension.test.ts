@@ -34,6 +34,10 @@ const modernPi = major > 0 || minor >= 87 ? localPi :
   pathToFileURL(join(hostPiRoot, "dist/index.js")).href;
 const { SessionManager } = await import(modernPi);
 const defaultAgentDir = mkdtempSync(join(tmpdir(), "pi-whereami-config-"));
+// Keep most behavioral tests on the old cadence; dedicated config tests below
+// verify the new defaults and configurable schedule independently.
+mkdirSync(join(defaultAgentDir, "whereami"), { recursive: true });
+writeFileSync(join(defaultAgentDir, "whereami", "config.json"), JSON.stringify({ intervals: [12, 8, 6, 4] }));
 after(() => rmSync(defaultAgentDir, { recursive: true, force: true }));
 
 function harness(sessionManager = SessionManager.inMemory("/tmp"), agentDir = defaultAgentDir, hasUI = true) {
@@ -361,12 +365,85 @@ test("headless mode and widget failures preserve trigger checks and checkpoint b
   }
 });
 
+async function triggerNextCheck(h: ReturnType<typeof harness>) {
+  for (let i = 0; i < 100; i++) {
+    const result = await h.decisions(1);
+    if (result?.continue === true) return result;
+  }
+  assert.fail("check did not trigger");
+}
+
 async function injectedPrompt(h: ReturnType<typeof harness>): Promise<string> {
   await h.emit("session_start");
-  assert.equal((await h.decisions(12))?.continue, true);
+  await triggerNextCheck(h);
   const request = await h.emit("context", { messages: [] });
   return request.messages.at(-1).content;
 }
+
+test("missing config uses 20 → 15 → 10 defaults", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-whereami-default-intervals-"));
+  try {
+    const h = harness(undefined, dir);
+    await h.emit("session_start");
+    await h.emit("agent_start");
+    assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 0\/20/);
+    assert.equal(await h.decisions(19), undefined);
+    assert.equal((await h.decisions(1))?.continue, true);
+    assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 20\/35/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config intervals support 1..8 positive integers and load once per extension", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-whereami-custom-intervals-"));
+  try {
+    const file = join(dir, "whereami", "config.json");
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({ intervals: [3, 2] }));
+    const h = harness(undefined, dir);
+    writeFileSync(file, JSON.stringify({ intervals: [5] }));
+    await h.emit("session_start");
+    await h.emit("agent_start");
+    assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 0\/3/);
+    assert.equal(await h.decisions(2), undefined);
+    assert.equal((await h.decisions(1))?.continue, true);
+    assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 3\/5/);
+
+    const reloaded = harness(undefined, dir);
+    await reloaded.emit("session_start");
+    await reloaded.emit("agent_start");
+    assert.match(reloaded.widgets.get("pi-whereami")!.content[0], /Decisions: 0\/5/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("invalid config falls back to the complete default schedule", async () => {
+  const invalidConfigs = [
+    "{",
+    JSON.stringify({ intervals: [] }),
+    JSON.stringify({ intervals: Array(9).fill(1) }),
+    JSON.stringify({ intervals: [20, 0, 10] }),
+    JSON.stringify({ intervals: [20, -1, 10] }),
+    JSON.stringify({ intervals: [20, 1.5, 10] }),
+    JSON.stringify({ intervals: [20, "10"] }),
+  ];
+  for (const content of invalidConfigs) {
+    const dir = mkdtempSync(join(tmpdir(), "pi-whereami-invalid-intervals-"));
+    try {
+      const file = join(dir, "whereami", "config.json");
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, content);
+      const h = harness(undefined, dir);
+      await h.emit("session_start");
+      await h.emit("agent_start");
+      assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 0\/20/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
 
 test("missing reorient.md uses the built-in strategy and fixed protocol", async () => {
   const prompt = await injectedPrompt(harness());

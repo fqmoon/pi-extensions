@@ -32,10 +32,28 @@ whereami · Decisions: 13/20 · Checkpoints: 1 · Checkpoint at decision 12
 默认检查间隔逐渐缩短：
 
 ```text
-12 → 8 → 6 → 4 → 4 → ...
+20 → 15 → 10 → 10 → ...
 ```
 
 每条新的用户消息都会重新计数。
+
+## Configuration
+
+如需修改检查节奏，创建：
+
+```text
+~/.pi/agent/whereami/config.json
+```
+
+例如：
+
+```json
+{
+  "intervals": [30, 20, 10]
+}
+```
+
+`intervals` 必须包含 **1 到 8 个正整数**。最后一个值会无限重复，因此 `[30, 20, 10]` 表示 `30 → 20 → 10 → 10 → ...`。配置不存在或无效时，整份配置回退到默认值 `[20, 15, 10]`。修改后执行 `/reload` 生效。
 
 它不监督 Agent，也不判断 Agent 对不对。它做的只是定期打断连续决策，让 Agent 回头看一眼：
 

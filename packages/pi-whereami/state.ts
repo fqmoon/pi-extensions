@@ -1,7 +1,12 @@
 import { stripVTControlCharacters } from "node:util";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 
-export const INTERVALS = [12, 8, 6, 4] as const;
+export const DEFAULT_INTERVALS = [20, 15, 10] as const;
+export type IntervalSchedule = readonly number[];
+
+export function intervalAt(intervals: IntervalSchedule, stage: number): number {
+  return intervals[Math.min(stage, intervals.length - 1)];
+}
 export const REQUEST_TYPE = "pi-whereami-request"; // Legacy sessions only.
 export const CHECK_TYPE = "pi-whereami-check";
 export const CHECK_RESPONSE_TYPE = "pi-whereami-response";
@@ -45,16 +50,16 @@ export function freshHudProgress(): HudProgress {
   return { decisions: 0, checkpoints: 0 };
 }
 
-export function advance(state: TriggerState, canCheck = true): boolean {
+export function advance(state: TriggerState, canCheck = true, intervals: IntervalSchedule = DEFAULT_INTERVALS): boolean {
   state.decisionsSinceCheck++;
-  if (!canCheck || state.decisionsSinceCheck < INTERVALS[state.stage]) return false;
+  if (!canCheck || state.decisionsSinceCheck < intervalAt(intervals, state.stage)) return false;
   state.decisionsSinceCheck = 0;
-  state.stage = Math.min(state.stage + 1, INTERVALS.length - 1);
+  state.stage = Math.min(state.stage + 1, intervals.length - 1);
   return true;
 }
 
 /** Restore the active path only; abandoned branches never contribute to this counter. */
-function restoreBranch(branch: readonly SessionEntry[]): { state: TriggerState; progress: HudProgress; checkpoint?: HudCheckpoint } {
+function restoreBranch(branch: readonly SessionEntry[], intervals: IntervalSchedule = DEFAULT_INTERVALS): { state: TriggerState; progress: HudProgress; checkpoint?: HudCheckpoint } {
   const state = freshState();
   let progress = freshHudProgress();
   let checkpoint: HudCheckpoint | undefined;
@@ -78,16 +83,17 @@ function restoreBranch(branch: readonly SessionEntry[]): { state: TriggerState; 
     } else if (entry.type === "custom" && entry.customType === CHECK_TYPE &&
       typeof (entry.data as { stage?: unknown } | undefined)?.stage === "number" &&
       Number.isInteger((entry.data as { stage: number }).stage) &&
-      (entry.data as { stage: number }).stage >= 0 && (entry.data as { stage: number }).stage < INTERVALS.length) {
+      (entry.data as { stage: number }).stage >= 0) {
       // A check consumes the interval even when no valid checkpoint follows.
-      state.stage = (entry.data as { stage: number }).stage;
+      // Old sessions may have used a longer schedule; clamp them to the current last stage.
+      state.stage = Math.min((entry.data as { stage: number }).stage, intervals.length - 1);
       state.decisionsSinceCheck = 0;
       // Old checks lack response IDs. Keep their consumed stage and infer only
       // their immediate response; new checks use explicit response markers.
       legacyRequest = (entry.data as { unit?: unknown }).unit !== "decision";
     } else if (entry.type === "custom_message" && entry.customType === REQUEST_TYPE) {
       // Older sessions persisted requests instead of non-context trigger checks.
-      state.stage = Math.min(state.stage + 1, INTERVALS.length - 1);
+      state.stage = Math.min(state.stage + 1, intervals.length - 1);
       state.decisionsSinceCheck = 0;
       legacyRequest = true;
     } else if (entry.type === "message" && entry.message.role === "assistant") {
@@ -107,12 +113,12 @@ function restoreBranch(branch: readonly SessionEntry[]): { state: TriggerState; 
   return { state, progress, checkpoint };
 }
 
-export function restoreState(branch: readonly SessionEntry[]): TriggerState {
-  return restoreBranch(branch).state;
+export function restoreState(branch: readonly SessionEntry[], intervals: IntervalSchedule = DEFAULT_INTERVALS): TriggerState {
+  return restoreBranch(branch, intervals).state;
 }
 
-export function restoreHudProgress(branch: readonly SessionEntry[]): HudProgress {
-  return restoreBranch(branch).progress;
+export function restoreHudProgress(branch: readonly SessionEntry[], intervals: IntervalSchedule = DEFAULT_INTERVALS): HudProgress {
+  return restoreBranch(branch, intervals).progress;
 }
 
 export interface CheckpointFields {
@@ -137,13 +143,13 @@ export function parseCheckpoint(content: unknown): Required<CheckpointFields> | 
 }
 
 /** Read the latest valid checkpoint and the decision count at which it was recorded. */
-export function restoreHudCheckpoint(branch: readonly SessionEntry[]): HudCheckpoint | undefined {
-  return restoreBranch(branch).checkpoint;
+export function restoreHudCheckpoint(branch: readonly SessionEntry[], intervals: IntervalSchedule = DEFAULT_INTERVALS): HudCheckpoint | undefined {
+  return restoreBranch(branch, intervals).checkpoint;
 }
 
 /** The panel is a view of recorded state, not collection progress. */
-export function formatHud(checkpoint: HudCheckpoint | undefined, triggerState: TriggerState, progress: HudProgress): string[] {
-  const target = progress.decisions - triggerState.decisionsSinceCheck + INTERVALS[triggerState.stage];
+export function formatHud(checkpoint: HudCheckpoint | undefined, triggerState: TriggerState, progress: HudProgress, intervals: IntervalSchedule = DEFAULT_INTERVALS): string[] {
+  const target = progress.decisions - triggerState.decisionsSinceCheck + intervalAt(intervals, triggerState.stage);
   const status = checkpoint ? `Checkpoint at decision ${checkpoint.decision}` : "No checkpoint yet";
   const header = `whereami · Decisions: ${progress.decisions}/${target} · Checkpoints: ${progress.checkpoints} · ${status}`;
   if (!checkpoint) return [header];

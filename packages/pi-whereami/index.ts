@@ -12,12 +12,13 @@ import {
   isDecision,
   CHECK_TYPE,
   CHECK_RESPONSE_TYPE,
-  INTERVALS,
+  DEFAULT_INTERVALS,
   restoreState,
   restoreHudProgress,
   restoreHudCheckpoint,
   parseCheckpoint,
   type HudCheckpoint,
+  type IntervalSchedule,
   CHECKPOINT_TYPE,
   TOOL_NAME,
 } from "./state.ts";
@@ -49,8 +50,23 @@ function loadReorientationPrompt(): string {
   return DEFAULT_REORIENTATION_PROMPT;
 }
 
+function loadIntervals(): IntervalSchedule {
+  try {
+    const config = JSON.parse(readFileSync(join(getAgentDir(), "whereami", "config.json"), "utf8")) as { intervals?: unknown };
+    const intervals = config?.intervals;
+    if (Array.isArray(intervals) && intervals.length >= 1 && intervals.length <= 8 &&
+      intervals.every((value) => Number.isSafeInteger(value) && value > 0)) {
+      return [...intervals];
+    }
+  } catch {
+    // Missing, unreadable, or malformed config falls back as a whole.
+  }
+  return DEFAULT_INTERVALS;
+}
+
 export default function (pi: ExtensionAPI) {
   const request = `${loadReorientationPrompt().trimEnd()}\n\n${CHECKPOINT_PROTOCOL}`;
+  const intervals = loadIntervals();
   let state = freshState();
   let collectingRequestedCheckpoint = false;
   let injectCheckpointRequest = false;
@@ -61,7 +77,7 @@ export default function (pi: ExtensionAPI) {
   const updateHud = (ctx: ExtensionContext, clear = false) => {
     if (!ctx.hasUI) return;
     try {
-      const lines = clear || !hudVisible ? undefined : formatHud(hudCheckpoint, state, hudProgress);
+      const lines = clear || !hudVisible ? undefined : formatHud(hudCheckpoint, state, hudProgress, intervals);
       ctx.ui.setWidget("pi-whereami", lines, { placement: "aboveEditor" });
     } catch {
       // UI rendering must never prevent a trigger or checkpoint from persisting.
@@ -79,8 +95,8 @@ export default function (pi: ExtensionAPI) {
     clearCollection();
   };
   const restore = (branch: Parameters<typeof restoreState>[0]) => {
-    state = restoreState(branch);
-    hudProgress = restoreHudProgress(branch);
+    state = restoreState(branch, intervals);
+    hudProgress = restoreHudProgress(branch, intervals);
     // An interrupted request must not become a new autonomous run on resume.
     clearCollection();
   };
@@ -89,7 +105,7 @@ export default function (pi: ExtensionAPI) {
     hudVisible = !ctx.isIdle();
     const branch = ctx.sessionManager.getBranch();
     restore(branch);
-    hudCheckpoint = restoreHudCheckpoint(branch);
+    hudCheckpoint = restoreHudCheckpoint(branch, intervals);
     updateHud(ctx);
     // PI can restore an older session's tool loadout without this newly installed tool.
     if (!pi.getActiveTools().includes(TOOL_NAME)) pi.setActiveTools([...pi.getActiveTools(), TOOL_NAME]);
@@ -203,7 +219,7 @@ export default function (pi: ExtensionAPI) {
     const canCheck = event.outcome === "completed" && hasTaskToolCall(event.message) &&
       !ctx.hasPendingMessages() && pi.getActiveTools().includes(TOOL_NAME);
     hudProgress.decisions++;
-    if (!advance(state, canCheck)) {
+    if (!advance(state, canCheck, intervals)) {
       updateHud(ctx);
       return entries.length > event.entries.length ? { entries } : undefined;
     }
