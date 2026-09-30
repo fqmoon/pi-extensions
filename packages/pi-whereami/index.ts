@@ -7,11 +7,14 @@ import {
   formatSnapshot,
   formatHud,
   freshState,
+  freshHudProgress,
   hasTaskToolCall,
   isDecision,
   CHECK_TYPE,
   CHECK_RESPONSE_TYPE,
+  INTERVALS,
   restoreState,
+  restoreHudProgress,
   restoreHudSnapshot,
   parseSnapshot,
   type HudSnapshot,
@@ -52,11 +55,14 @@ export default function (pi: ExtensionAPI) {
   let awaitingSnapshot = false;
   let injectSnapshotRequest = false;
   let hudSnapshot: HudSnapshot | undefined;
+  let hudProgress = freshHudProgress();
+  let running = false;
+  let collectionTarget: number | undefined;
 
   const updateHud = (ctx: ExtensionContext, clear = false) => {
     if (!ctx.hasUI) return;
     try {
-      const lines = clear ? undefined : formatHud(hudSnapshot, state, awaitingSnapshot);
+      const lines = clear || !running ? undefined : formatHud(hudSnapshot, state, hudProgress, awaitingSnapshot, collectionTarget);
       if (lines && hudSnapshot?.previousInput) {
         for (let i = 1; i < lines.length; i++) lines[i] = ctx.ui.theme.fg("muted", lines[i]);
       }
@@ -69,18 +75,22 @@ export default function (pi: ExtensionAPI) {
   const clearRequest = () => {
     awaitingSnapshot = false;
     injectSnapshotRequest = false;
+    collectionTarget = undefined;
   };
   const reset = () => {
     state = freshState();
+    hudProgress = freshHudProgress();
     clearRequest();
   };
   const restore = (branch: Parameters<typeof restoreState>[0]) => {
     state = restoreState(branch);
+    hudProgress = restoreHudProgress(branch);
     // An interrupted request must not become a new autonomous run on resume.
     clearRequest();
   };
 
   const onSessionPath = (ctx: ExtensionContext) => {
+    running = !ctx.isIdle();
     const branch = ctx.sessionManager.getBranch();
     restore(branch);
     hudSnapshot = restoreHudSnapshot(branch);
@@ -91,6 +101,14 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => onSessionPath(ctx));
   pi.on("session_tree", (_event, ctx) => onSessionPath(ctx));
   pi.on("session_shutdown", (_event, ctx) => updateHud(ctx, true));
+  pi.on("agent_start", (_event, ctx) => {
+    running = true;
+    updateHud(ctx);
+  });
+  pi.on("agent_end", (_event, ctx) => {
+    running = false;
+    updateHud(ctx);
+  });
 
   // Only a delivered user message starts a new counting interval.
   pi.on("message_start", (event, ctx) => {
@@ -163,6 +181,7 @@ export default function (pi: ExtensionAPI) {
         const fields = parseSnapshot(snapshot);
         if (fields) {
           hudSnapshot = { fields, previousInput: false };
+          hudProgress.snapshots++;
         }
       }
       clearRequest();
@@ -177,12 +196,15 @@ export default function (pi: ExtensionAPI) {
     // not decisions; this keeps live state and branch replay in agreement.
     const canCheck = event.outcome === "completed" && hasTaskToolCall(event.message) &&
       !ctx.hasPendingMessages() && pi.getActiveTools().includes(TOOL_NAME);
+    const target = hudProgress.decisions - state.decisionsSinceCheck + INTERVALS[state.stage];
+    hudProgress.decisions++;
     if (!advance(state, canCheck)) {
       updateHud(ctx);
       return entries.length > event.entries.length ? { entries } : undefined;
     }
     entries.push({ type: "custom", customType: CHECK_TYPE, data: { stage: state.stage, unit: "decision" } });
     awaitingSnapshot = true;
+    collectionTarget = target;
     injectSnapshotRequest = true;
     updateHud(ctx);
     return { entries, continue: true };

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  advance, formatSnapshot, formatHud, parseSnapshot, restoreHudSnapshot, freshState, INTERVALS, hasTaskToolCall, isDecision,
+  advance, formatSnapshot, formatHud, parseSnapshot, restoreHudSnapshot, freshHudProgress, restoreHudProgress, freshState, INTERVALS, hasTaskToolCall, isDecision,
   CHECK_TYPE, CHECK_RESPONSE_TYPE, REQUEST_TYPE, restoreState, SNAPSHOT_TYPE, TOOL_NAME,
 } from "../state.ts";
 
@@ -31,12 +31,12 @@ test("HUD parses durable snapshots and ignores malformed history", () => {
 
 test("HUD shows waiting progress without inventing fields and sanitizes only its display", () => {
   const state = { stage: 0, decisionsSinceCheck: 3 };
-  assert.deepEqual(formatHud(undefined, state, false), ["whereami · Awaiting first snapshot · Decisions 3/12"]);
-  assert.deepEqual(formatHud(undefined, state, true), ["whereami · Updating snapshot"]);
+  assert.deepEqual(formatHud(undefined, state, { decisions: 3, snapshots: 0 }, false), ["whereami · Decisions: 3/12 · Snapshots: 0 · Awaiting first snapshot"]);
+  assert.deepEqual(formatHud(undefined, { stage: 1, decisionsSinceCheck: 0 }, { decisions: 12, snapshots: 0 }, true), ["whereami · Decisions: 12/12 · Snapshots: 0 · Updating snapshot"]);
   const fields = { level: "module", scope: "\x1b[31mrenderer\x1b[0m", state: "dirty tracking", next: "inspect" };
   const hud = { fields, previousInput: true };
-  const lines = formatHud(hud, state, false);
-  assert.equal(lines[0], "whereami · Awaiting current snapshot · Decisions 3/12");
+  const lines = formatHud(hud, state, { decisions: 3, snapshots: 0 }, false);
+  assert.equal(lines[0], "whereami · Decisions: 3/12 · Snapshots: 0 · Awaiting current snapshot");
   assert.equal(lines[1], "History · Level: module · Scope: renderer");
   assert.equal(fields.scope, "\x1b[31mrenderer\x1b[0m"); // Original durable data is untouched.
 });
@@ -132,4 +132,21 @@ test("invalid snapshot fields are skipped, not filled in by the extension", () =
   assert.equal(formatSnapshot({ level: "file", scope: "renderer", state: "", next: "read" }), undefined);
   assert.equal(formatSnapshot({ level: "file", scope: "renderer\nother", state: "x", next: "read" }), undefined);
   assert.equal(formatSnapshot({ level: "file", scope: "renderer", state: "x", next: "x".repeat(161) }), undefined);
+});
+
+test("HUD replay shares decision exemptions and counts only valid snapshots after the latest user input", () => {
+  const valid = { type: "custom_message", customType: SNAPSHOT_TYPE,
+    content: formatSnapshot({ level: "module", scope: "renderer", state: "dirty", next: "inspect" }) };
+  const turns = (n: number) => Array.from({ length: n }, (_, i) => assistant(`task-${i}`, ["read"]));
+  const branch = [user, ...turns(12), check(1), assistant("sample", [TOOL_NAME]), response("sample"), valid,
+    assistant("mixed", [TOOL_NAME, "read"]), response("mixed"),
+    { type: "custom_message", customType: SNAPSHOT_TYPE, content: "bad" },
+    assistant("failed", ["read"], "error"), { type: "context_edit", targetId: "task-0", replacement: null }];
+  const progress = restoreHudProgress(branch as any);
+  assert.deepEqual(progress, { decisions: 13, snapshots: 1 });
+  assert.match(formatHud(undefined, restoreState(branch as any), progress, false)[0], /Decisions: 13\/20 · Snapshots: 1/);
+  assert.deepEqual(restoreHudProgress([...branch, user] as any), freshHudProgress());
+  // A due check deferred by the actual trigger gate shifts the next threshold.
+  const delayed = [user, ...turns(15), check(1), assistant("later", ["read"])];
+  assert.match(formatHud(undefined, restoreState(delayed as any), restoreHudProgress(delayed as any), false)[0], /Decisions: 16\/23/);
 });

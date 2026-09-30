@@ -33,6 +33,15 @@ export function freshState(): TriggerState {
   return { stage: 0, decisionsSinceCheck: 0 };
 }
 
+export interface HudProgress {
+  decisions: number;
+  snapshots: number;
+}
+
+export function freshHudProgress(): HudProgress {
+  return { decisions: 0, snapshots: 0 };
+}
+
 export function advance(state: TriggerState, canCheck = true): boolean {
   state.decisionsSinceCheck++;
   if (!canCheck || state.decisionsSinceCheck < INTERVALS[state.stage]) return false;
@@ -42,8 +51,9 @@ export function advance(state: TriggerState, canCheck = true): boolean {
 }
 
 /** Restore the active path only; abandoned branches never contribute to this counter. */
-export function restoreState(branch: readonly SessionEntry[]): TriggerState {
+function restoreBranch(branch: readonly SessionEntry[]): { state: TriggerState; progress: HudProgress } {
   const state = freshState();
+  let progress = freshHudProgress();
   // These entries follow the response at its safe boundary. Resolve them first
   // so an interrupted request does not exempt unrelated work after resume.
   const requestedResponses = new Set<string>();
@@ -58,6 +68,7 @@ export function restoreState(branch: readonly SessionEntry[]): TriggerState {
     if (entry.type === "message" && entry.message.role === "user") {
       state.stage = 0;
       state.decisionsSinceCheck = 0;
+      progress = freshHudProgress();
       legacyRequest = false;
     } else if (entry.type === "custom" && entry.customType === CHECK_TYPE &&
       typeof (entry.data as { stage?: unknown } | undefined)?.stage === "number" &&
@@ -75,11 +86,24 @@ export function restoreState(branch: readonly SessionEntry[]): TriggerState {
       state.decisionsSinceCheck = 0;
       legacyRequest = true;
     } else if (entry.type === "message" && entry.message.role === "assistant") {
-      if (isDecision(entry.message, legacyRequest || requestedResponses.has(entry.id))) state.decisionsSinceCheck++;
+      if (isDecision(entry.message, legacyRequest || requestedResponses.has(entry.id))) {
+        state.decisionsSinceCheck++;
+        progress.decisions++;
+      }
       legacyRequest = false;
+    } else if (entry.type === "custom_message" && entry.customType === SNAPSHOT_TYPE && parseSnapshot(entry.content)) {
+      progress.snapshots++;
     }
   }
-  return state;
+  return { state, progress };
+}
+
+export function restoreState(branch: readonly SessionEntry[]): TriggerState {
+  return restoreBranch(branch).state;
+}
+
+export function restoreHudProgress(branch: readonly SessionEntry[]): HudProgress {
+  return restoreBranch(branch).progress;
 }
 
 export interface SnapshotFields {
@@ -118,17 +142,22 @@ export function restoreHudSnapshot(branch: readonly SessionEntry[]): HudSnapshot
 }
 
 /** The panel is a view of the last snapshot, not another model-context message. */
-export function formatHud(snapshot: HudSnapshot | undefined, triggerState: TriggerState, updating: boolean): string[] {
+export function formatHud(snapshot: HudSnapshot | undefined, triggerState: TriggerState, progress: HudProgress, updating: boolean, collectionTarget = progress.decisions): string[] {
+  // Preserve the due threshold during collection, even if its safe boundary
+  // was delayed. The next target uses the actual last check and stage interval.
+  const target = updating ? collectionTarget
+    : progress.decisions - triggerState.decisionsSinceCheck + INTERVALS[triggerState.stage];
   const title = updating ? "Updating snapshot" : !snapshot || snapshot.previousInput
-    ? `Awaiting ${snapshot ? "current" : "first"} snapshot · Decisions ${triggerState.decisionsSinceCheck}/${INTERVALS[triggerState.stage]}`
+    ? `Awaiting ${snapshot ? "current" : "first"} snapshot`
     : "Latest snapshot";
-  if (!snapshot) return [`whereami · ${title}`];
+  const header = `whereami · Decisions: ${progress.decisions}/${target} · Snapshots: ${progress.snapshots} · ${title}`;
+  if (!snapshot) return [header];
   // Keep terminal control sequences out of the widget. The durable snapshot
   // remains unchanged, and the host handles ordinary wrapping and styling.
   const plain = (text: string) => stripVTControlCharacters(text).replace(/[\x00-\x1f\x7f-\x9f]/g, "");
   const { level, scope, state, next } = snapshot.fields;
   return [
-    `whereami · ${title}`,
+    header,
     `${snapshot.previousInput ? "History · " : ""}Level: ${plain(level)} · Scope: ${plain(scope)}`,
     `State: ${plain(state)}`,
     `Next: ${plain(next)}`,
