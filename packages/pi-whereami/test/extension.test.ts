@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { registerHooks } from "node:module";
 import { after, test } from "node:test";
-import { CHECK_TYPE, REQUEST_TYPE, SNAPSHOT_TYPE, TOOL_NAME } from "../state.ts";
+import { CHECK_TYPE, CHECK_RESPONSE_TYPE, REQUEST_TYPE, restoreState, SNAPSHOT_TYPE, TOOL_NAME } from "../state.ts";
 
 // The monorepo has an older local PI installation. Resolve pi-ai from the
 // host PI dependency tree for this test; extension imports remain normal.
@@ -68,7 +68,7 @@ function harness(sessionManager = SessionManager.inMemory("/tmp"), agentDir = de
     const message = {
       role: "assistant", content: blocks ?? results.map((result) => ({
         type: "toolCall", id: result.toolCallId, name: result.toolName, arguments: {},
-      })), timestamp: Date.now(), stopReason: outcome === "completed" ? "toolUse" : outcome,
+      })), timestamp: Date.now(), stopReason: outcome === "completed" ? (results.length ? "toolUse" : "stop") : outcome,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
     };
     const messageEntryId = sessionManager.appendMessage(message);
@@ -82,12 +82,20 @@ function harness(sessionManager = SessionManager.inMemory("/tmp"), agentDir = de
     return result;
   };
   const actions = (n: number) => Array.from({ length: n }, (_, i) => ({ role: "toolResult", toolName: "read", toolCallId: `id-${i}`, isError: false }));
-  return { ctx, emit, boundary, actions, setToolAvailable(available: boolean) { toolAvailable = available; }, setPendingMessages(pending: boolean) { pendingMessages = pending; }, get tool() { return tool; } };
+  const decisions = async (n: number, outcome = "completed") => {
+    let result;
+    for (let i = 0; i < n; i++) {
+      result = await boundary(actions(1), outcome);
+      if (i < n - 1) assert.notEqual(result?.continue, true, "check triggered before the expected decision");
+    }
+    return result;
+  };
+  return { ctx, emit, boundary, actions, decisions, setToolAvailable(available: boolean) { toolAvailable = available; }, setPendingMessages(pending: boolean) { pendingMessages = pending; }, get tool() { return tool; } };
 }
 
 async function injectedPrompt(h: ReturnType<typeof harness>): Promise<string> {
   await h.emit("session_start");
-  assert.equal((await h.boundary(h.actions(12)))?.continue, true);
+  assert.equal((await h.decisions(12))?.continue, true);
   const request = await h.emit("context", { messages: [] });
   return request.messages.at(-1).content;
 }
@@ -142,15 +150,15 @@ test("blank or unreadable reorient.md falls back without failing the agent", asy
   }
 });
 
-test("tool batch requests one check; main model tool writes exactly one custom snapshot and keeps working", async () => {
+test("decision turns request one check; main model tool writes exactly one custom snapshot and keeps working", async () => {
   const h = harness();
   await h.emit("session_start");
   await h.emit("message_start", { message: { role: "user" } });
-  assert.equal(await h.boundary(h.actions(11)), undefined);
-  const triggered = await h.boundary(h.actions(1));
+  assert.equal(await h.decisions(11), undefined);
+  const triggered = await h.decisions(1);
   assert.equal(triggered.continue, true);
   assert.equal(triggered.entries[0].customType, CHECK_TYPE);
-  assert.deepEqual(triggered.entries[0].data, { stage: 1 });
+  assert.deepEqual(triggered.entries[0].data, { stage: 1, unit: "decision" });
   assert.equal(h.ctx.sessionManager.getBranch().some((entry: any) => entry.customType === REQUEST_TYPE), false);
   const context = [{ role: "user", content: "real task", timestamp: 1 }];
   const requested = await h.emit("context", { messages: context });
@@ -159,9 +167,9 @@ test("tool batch requests one check; main model tool writes exactly one custom s
   assert.deepEqual((await h.emit("context", { messages: context }))?.messages, undefined);
   const response = await h.tool.execute("check-1", { level: "module", scope: "renderer", state: "dirty propagation is likely", next: "inspect invalidation" });
   const after = await h.boundary([{ role: "toolResult", toolCallId: "check-1", toolName: TOOL_NAME, isError: false, details: response.details }]);
-  assert.deepEqual(after.entries.map((entry: any) => entry.type), ["context_edit", "context_edit", "custom_message"]);
-  assert.equal(after.entries[2].customType, SNAPSHOT_TYPE);
-  assert.equal(after.entries[2].display, true);
+  assert.deepEqual(after.entries.map((entry: any) => entry.type), ["custom", "context_edit", "context_edit", "custom_message"]);
+  assert.equal(after.entries[3].customType, SNAPSHOT_TYPE);
+  assert.equal(after.entries[3].display, true);
   assert.equal(after.continue, undefined); // Normal tool-follow-up, not a forced steering turn.
   const branch = h.ctx.sessionManager.getBranch();
   assert.equal(branch.filter((entry: any) => entry.customType === SNAPSHOT_TYPE).length, 1);
@@ -178,21 +186,22 @@ test("tool batch requests one check; main model tool writes exactly one custom s
   assert.equal(JSON.stringify(branch).includes("Re-orient before continuing"), false);
   assert.equal(JSON.stringify(projected).includes("Re-orient before continuing"), false);
   assert.equal((await h.emit("context", { messages: projected }))?.messages, undefined);
-  assert.equal(await h.boundary(h.actions(7)), undefined);
-  assert.equal((await h.boundary(h.actions(1)))?.continue, true); // next interval is 8
+  assert.equal(await h.decisions(7), undefined);
+  assert.equal((await h.decisions(1))?.continue, true); // next interval is 8
 });
 
 test("mixed snapshot and task tool calls retain the whole task turn in context", async () => {
   const h = harness();
   await h.emit("session_start");
-  assert.equal((await h.boundary(h.actions(12)))?.continue, true);
+  assert.equal((await h.decisions(12))?.continue, true);
   await h.emit("context", { messages: [] });
   const recorded = await h.tool.execute("sample", { level: "module", scope: "renderer", state: "dirty tracking", next: "inspect" });
   const after = await h.boundary([
     { toolName: TOOL_NAME, toolCallId: "sample", isError: false, details: recorded.details },
     { toolName: "read", toolCallId: "task", isError: false },
   ]);
-  assert.deepEqual(after.entries.map((entry: any) => entry.type), ["custom_message"]);
+  assert.deepEqual(after.entries.map((entry: any) => entry.type), ["custom", "custom_message"]);
+  assert.deepEqual(restoreState(h.ctx.sessionManager.getBranch()), { stage: 1, decisionsSinceCheck: 1 });
   const context = h.ctx.sessionManager.buildSessionContext().messages;
   assert.equal(context.some((message: any) => message.role === "assistant" && message.content.some((part: any) => part.name === "read")), true);
   assert.equal(context.some((message: any) => message.role === "toolResult" && message.toolName === "read"), true);
@@ -202,33 +211,33 @@ test("mixed snapshot and task tool calls retain the whole task turn in context",
 test("assistant text or unresolved result IDs prevent unsafe cleanup", async () => {
   const h = harness();
   await h.emit("session_start");
-  await h.boundary(h.actions(12));
+  await h.decisions(12);
   const recorded = await h.tool.execute("sample", { level: "module", scope: "renderer", state: "dirty tracking", next: "inspect" });
   const result = { role: "toolResult", toolName: TOOL_NAME, toolCallId: "sample", isError: false, details: recorded.details };
   const after = await h.boundary([result], "completed", [
     { type: "text", text: "Task progress" },
     { type: "toolCall", name: TOOL_NAME, id: "sample", arguments: {} },
   ]);
-  assert.deepEqual(after.entries.map((entry: any) => entry.type), ["custom_message"]);
-  await h.boundary(h.actions(8));
+  assert.deepEqual(after.entries.map((entry: any) => entry.type), ["custom", "custom_message"]);
+  await h.decisions(8);
   const noIds = await h.emit("turn_end", {
     entries: [], outcome: "completed", toolResults: [result], messageEntryId: "missing", toolResultEntryIds: [],
     message: { role: "assistant", content: [{ type: "toolCall", name: TOOL_NAME, id: "sample", arguments: {} }] },
   });
-  assert.deepEqual(noIds.entries.map((entry: any) => entry.type), ["custom_message"]);
+  assert.deepEqual(noIds.entries.map((entry: any) => entry.type), ["custom", "custom_message"]);
 });
 
 test("required fields and invalid or interrupted checks never force a retry", async () => {
   const h = harness();
   assert.deepEqual(h.tool.parameters.required?.sort(), ["level", "next", "scope", "state"]);
   await h.emit("session_start");
-  assert.equal((await h.boundary(h.actions(12)))?.continue, true);
+  assert.equal((await h.decisions(12))?.continue, true);
   const malformed = await h.tool.execute("bad", { level: "module", scope: "renderer", state: "x\ny", next: "inspect" });
   assert.equal(malformed.details.snapshot, undefined);
-  assert.equal(await h.boundary([{ toolName: TOOL_NAME, toolCallId: "bad", details: malformed.details }]), undefined);
+  assert.equal((await h.boundary([{ toolName: TOOL_NAME, toolCallId: "bad", details: malformed.details }])).entries[0].customType, CHECK_RESPONSE_TYPE);
   assert.equal(h.ctx.sessionManager.getBranch().some((entry: any) => entry.customType === SNAPSHOT_TYPE), false);
   assert.equal((await h.emit("context", { messages: [] }))?.messages, undefined);
-  assert.equal((await h.boundary(h.actions(8)))?.continue, true);
+  assert.equal((await h.decisions(8))?.continue, true);
   await h.emit("agent_before_settle");
   assert.equal((await h.emit("context", { messages: [] }))?.messages, undefined);
   assert.equal(await h.boundary([]), undefined);
@@ -238,48 +247,135 @@ test("bad fields and failed checks do not interrupt the task; user resets at dee
   const h = harness();
   await h.emit("session_start");
   for (const n of [12, 8, 6, 4]) {
-    assert.equal((await h.boundary(h.actions(n)))?.continue, true);
+    assert.equal((await h.decisions(n))?.continue, true);
     const malformed = await h.tool.execute("bad", { scope: "renderer" });
     assert.equal(malformed.details.snapshot, undefined);
-    assert.equal(await h.boundary([{ role: "toolResult", toolName: TOOL_NAME, isError: false, details: malformed.details }]), undefined);
+    assert.equal((await h.boundary([{ role: "toolResult", toolName: TOOL_NAME, isError: false, details: malformed.details }])).entries[0].customType, CHECK_RESPONSE_TYPE);
   }
   // A failed sampling turn (no tool called) is allowed to finish normally.
-  assert.equal((await h.boundary(h.actions(4)))?.continue, true);
-  assert.equal(await h.boundary([]), undefined);
+  assert.equal((await h.decisions(4))?.continue, true);
+  assert.equal((await h.boundary([])).entries[0].customType, CHECK_RESPONSE_TYPE);
   h.setPendingMessages(true);
-  assert.equal(await h.boundary(h.actions(12)), undefined); // old run, before queued input is delivered
+  assert.equal(await h.decisions(12), undefined); // old run, before queued input is delivered
   h.setPendingMessages(false);
   await h.emit("message_start", { message: { role: "user" } });
-  assert.equal(await h.boundary(h.actions(11)), undefined);
+  assert.equal(await h.decisions(11), undefined);
   await h.emit("message_start", { message: { role: "custom" } });
-  assert.equal((await h.boundary(h.actions(1)))?.continue, true); // custom is not a reset
+  assert.equal((await h.decisions(1))?.continue, true); // custom is not a reset
 });
 
 test("handled input does not suppress checks or reset the counting interval", async () => {
   const h = harness();
   await h.emit("session_start");
-  assert.equal(await h.boundary(h.actions(11)), undefined);
+  assert.equal(await h.decisions(11), undefined);
   await h.emit("input", { source: "interactive", text: ":status" }); // another extension handles it
-  assert.equal((await h.boundary(h.actions(1)))?.continue, true);
+  assert.equal((await h.decisions(1))?.continue, true);
 });
 
-test("error turns do not force sampling, but their task tool calls still count", async () => {
+test("provider error turns do not count as decisions or force sampling", async () => {
   const h = harness();
   await h.emit("session_start");
-  assert.equal(await h.boundary(h.actions(11), "error"), undefined);
-  assert.equal((await h.boundary(h.actions(1)))?.continue, true);
+  assert.equal(await h.decisions(11, "error"), undefined);
+  assert.equal(await h.decisions(11, "aborted"), undefined);
+  assert.equal(await h.decisions(11), undefined);
+  assert.equal((await h.decisions(1))?.continue, true);
+});
+
+test("one large parallel batch is one decision, including failed tool results", async () => {
+  const h = harness();
+  await h.emit("session_start");
+  assert.equal(await h.boundary(h.actions(20)), undefined);
+  assert.deepEqual(restoreState(h.ctx.sessionManager.getBranch()), { stage: 0, decisionsSinceCheck: 1 });
+  assert.equal(await h.decisions(10), undefined);
+  assert.equal((await h.boundary([{ toolName: "read", isError: true }]))?.continue, true);
+  assert.deepEqual(restoreState(h.ctx.sessionManager.getBranch()), { stage: 1, decisionsSinceCheck: 0 });
+});
+
+test("status-only responses and ordinary text count; final answers do not force continuation", async () => {
+  const h = harness();
+  await h.emit("session_start");
+  assert.equal(await h.decisions(10), undefined);
+  assert.equal(await h.boundary([{ toolName: "get_context_usage" }]), undefined);
+  assert.equal(await h.boundary([], "completed", [{ type: "text", text: "Finished the task." }]), undefined);
+  assert.deepEqual(restoreState(h.ctx.sessionManager.getBranch()), { stage: 0, decisionsSinceCheck: 12 });
+  assert.equal(h.ctx.sessionManager.getBranch().some((entry: any) => entry.customType === CHECK_TYPE), false);
+  assert.equal((await h.emit("context", { messages: [] }))?.messages, undefined);
+  // If another extension legitimately continues the task, the next safe tool
+  // boundary may consume the due interval; no stage was consumed by the final.
+  assert.equal((await h.boundary([{ toolName: "status" }]))?.continue, true);
+});
+
+test("requested text without a snapshot is exempt on resume without leaking a prompt", async () => {
+  const h = harness();
+  await h.emit("session_start");
+  await h.decisions(12);
+  await h.emit("context", { messages: [] });
+  const after = await h.boundary([], "completed", [{ type: "text", text: "No snapshot provided." }]);
+  assert.deepEqual(after.entries.map((entry: any) => entry.customType), [CHECK_RESPONSE_TYPE]);
+  assert.equal(after.continue, undefined);
+  const branch = h.ctx.sessionManager.getBranch();
+  assert.deepEqual(restoreState(branch), { stage: 1, decisionsSinceCheck: 0 });
+  assert.equal(JSON.stringify(h.ctx.sessionManager.buildSessionContext().messages).includes(CHECK_RESPONSE_TYPE), false);
+  const resumed = harness(h.ctx.sessionManager);
+  await resumed.emit("session_start");
+  assert.equal(await resumed.decisions(7), undefined);
+  assert.equal((await resumed.decisions(1))?.continue, true);
+});
+
+test("requested mixed work counts once even when the snapshot is missing or invalid", async () => {
+  for (const sample of [[], [{ toolName: TOOL_NAME, details: { snapshot: undefined } }]]) {
+    const h = harness();
+    await h.emit("session_start");
+    await h.decisions(12);
+    await h.emit("context", { messages: [] });
+    const after = await h.boundary([...sample, ...h.actions(20)]);
+    assert.equal(after.continue, undefined);
+    assert.deepEqual(restoreState(h.ctx.sessionManager.getBranch()), { stage: 1, decisionsSinceCheck: 1 });
+    assert.equal(await h.decisions(6), undefined);
+    assert.equal((await h.decisions(1))?.continue, true);
+  }
+});
+
+test("interrupting collection before a response does not exempt the next main-task response", async () => {
+  const h = harness();
+  await h.emit("session_start");
+  await h.decisions(12);
+  await h.emit("agent_before_settle");
+  const resumed = harness(h.ctx.sessionManager);
+  await resumed.emit("session_start");
+  assert.equal(await resumed.boundary([], "completed", [{ type: "text", text: "Continuing the main task." }]), undefined);
+  assert.deepEqual(restoreState(h.ctx.sessionManager.getBranch()), { stage: 1, decisionsSinceCheck: 1 });
+  assert.equal(await resumed.decisions(6), undefined);
+  assert.equal((await resumed.decisions(1))?.continue, true);
+});
+
+test("pending input suppresses checks while keeping decision replay consistent", async () => {
+  const h = harness();
+  await h.emit("session_start");
+  await h.decisions(11);
+  h.setPendingMessages(true);
+  assert.equal(await h.decisions(1), undefined);
+  assert.deepEqual(restoreState(h.ctx.sessionManager.getBranch()), { stage: 0, decisionsSinceCheck: 12 });
+  // Real delivery resets the interval, unlike custom messages.
+  const user = { role: "user", content: [{ type: "text", text: "new task" }], timestamp: Date.now() };
+  h.ctx.sessionManager.appendMessage(user);
+  await h.emit("message_start", { message: user });
+  h.setPendingMessages(false);
+  assert.deepEqual(restoreState(h.ctx.sessionManager.getBranch()), { stage: 0, decisionsSinceCheck: 0 });
+  assert.equal(await h.decisions(11), undefined);
+  assert.equal((await h.decisions(1))?.continue, true);
 });
 
 test("an older session's tool loadout activates the plugin; later unavailability cannot interrupt the task", async () => {
   const h = harness();
   h.setToolAvailable(false);
   await h.emit("session_start");
-  assert.equal((await h.boundary(h.actions(12)))?.continue, true);
+  assert.equal((await h.decisions(12))?.continue, true);
   await h.emit("message_start", { message: { role: "user" } });
   h.setToolAvailable(false);
-  assert.equal(await h.boundary(h.actions(12)), undefined);
+  assert.equal(await h.decisions(12), undefined);
   h.setToolAvailable(true);
-  assert.equal((await h.boundary(h.actions(1)))?.continue, true);
+  assert.equal((await h.decisions(1))?.continue, true);
 });
 
 test("resuming a session keeps checkpoint and context edits on their own branch", async () => {
@@ -289,7 +385,7 @@ test("resuming a session keeps checkpoint and context edits on their own branch"
     const h = harness(manager);
     await h.emit("session_start");
     manager.appendMessage({ role: "user", content: [{ type: "text", text: "task" }], timestamp: Date.now() });
-    assert.equal((await h.boundary(h.actions(12)))?.continue, true);
+    assert.equal((await h.decisions(12))?.continue, true);
     await h.emit("context", { messages: [] });
     const anchor = manager.getLeafId();
     const recorded = await h.tool.execute("sample", { level: "module", scope: "renderer", state: "dirty tracking", next: "inspect" });
@@ -304,14 +400,14 @@ test("resuming a session keeps checkpoint and context edits on their own branch"
     assert.equal(messages.at(-1)?.role, "custom");
     const resumedHarness = harness(resumed);
     await resumedHarness.emit("session_start");
-    assert.equal(await resumedHarness.boundary(resumedHarness.actions(7)), undefined);
-    assert.equal((await resumedHarness.boundary(resumedHarness.actions(1)))?.continue, true);
+    assert.equal(await resumedHarness.decisions(7), undefined);
+    assert.equal((await resumedHarness.decisions(1))?.continue, true);
     resumed.branch(anchor);
     const sibling = harness(resumed);
     await sibling.emit("session_tree");
     assert.equal(resumed.getBranch().some((entry: any) => entry.customType === SNAPSHOT_TYPE), false);
     assert.equal(resumed.getBranch().some((entry: any) => entry.type === "context_edit"), false);
-    assert.equal((await sibling.boundary(sibling.actions(8)))?.continue, true);
+    assert.equal((await sibling.decisions(8))?.continue, true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -327,12 +423,12 @@ test("session file resume and branch keep the snapshot in history without pollut
     const snapshot = manager.appendCustomMessageEntry(SNAPSHOT_TYPE, "[whereami]\n\nLevel: module\nScope: renderer\nState: likely invalidation\nNext: inspect boundary", true);
     const path = manager.getSessionFile()!;
     const resumed = SessionManager.open(path);
-    assert.equal(resumed.getBranch().some((entry) => entry.id === snapshot), true);
+    assert.equal(resumed.getBranch().some((entry: any) => entry.id === snapshot), true);
     assert.equal(resumed.buildSessionContext().messages.at(-1)?.role, "custom");
     resumed.branch(anchor);
-    assert.equal(resumed.getBranch().some((entry) => entry.id === snapshot), false);
+    assert.equal(resumed.getBranch().some((entry: any) => entry.id === snapshot), false);
     resumed.appendCustomMessageEntry(SNAPSHOT_TYPE, "[whereami]\n\nLevel: file\nScope: second branch\nState: unknown\nNext: inspect", true);
-    assert.equal(resumed.getBranch().some((entry) => entry.id === snapshot), false);
+    assert.equal(resumed.getBranch().some((entry: any) => entry.id === snapshot), false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

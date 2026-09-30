@@ -6,8 +6,10 @@ import {
   advance,
   formatSnapshot,
   freshState,
-  isAction,
+  hasTaskToolCall,
+  isDecision,
   CHECK_TYPE,
+  CHECK_RESPONSE_TYPE,
   restoreState,
   SNAPSHOT_TYPE,
   TOOL_NAME,
@@ -104,7 +106,9 @@ export default function (pi: ExtensionAPI) {
     // The boundary runs after the entire tool batch has been persisted. Never insert
     // a custom message between a tool call and its result (invalid on replay).
     const entries = [...event.entries];
+    const snapshotRequested = awaitingSnapshot;
     if (awaitingSnapshot) {
+      entries.push({ type: "custom", customType: CHECK_RESPONSE_TYPE, data: { messageEntryId: event.messageEntryId } });
       const snapshotIndex = event.toolResults.findIndex(
         (result) => result.toolName === TOOL_NAME && !result.isError &&
           typeof (result.details as { snapshot?: unknown } | undefined)?.snapshot === "string",
@@ -121,9 +125,9 @@ export default function (pi: ExtensionAPI) {
           event.message.content[0].id === result.toolCallId;
         const resultId = event.toolResultEntryIds.length === event.toolResults.length
           ? event.toolResultEntryIds[snapshotIndex] : undefined;
-        const assistantEntry = event.messageEntryId && ctx.sessionManager.getEntry(event.messageEntryId);
-        const resultEntry = resultId && ctx.sessionManager.getEntry(resultId);
-        if (snapshotOnly && assistantEntry?.type === "message" && assistantEntry.message.role === "assistant" &&
+        const assistantEntry = ctx.sessionManager.getEntry(event.messageEntryId);
+        const resultEntry = resultId ? ctx.sessionManager.getEntry(resultId) : undefined;
+        if (snapshotOnly && resultId && assistantEntry?.type === "message" && assistantEntry.message.role === "assistant" &&
           resultEntry?.type === "message" && resultEntry.message.role === "toolResult" &&
           resultEntry.message.toolCallId === result.toolCallId) {
           entries.push({ type: "context_edit", targetId: event.messageEntryId, replacement: null });
@@ -134,20 +138,18 @@ export default function (pi: ExtensionAPI) {
       clearRequest();
     }
 
-    // Do not sample the old run while a new message is queued for delivery.
-    if (ctx.hasPendingMessages()) return entries.length > event.entries.length ? { entries } : undefined;
-    const actionCount = event.toolResults.filter((result) => isAction(result.toolName)).length;
-    if (actionCount === 0) return entries.length > event.entries.length ? { entries } : undefined;
-    if (event.outcome !== "completed" || !pi.getActiveTools().includes(TOOL_NAME)) {
-      // Completed tool calls still count, but an error or an unavailable snapshot
-      // tool must never interrupt the main agent with an impossible request.
-      state.actionsSinceCheck += actionCount;
+    if (!isDecision(event.message, snapshotRequested)) {
       return entries.length > event.entries.length ? { entries } : undefined;
     }
-    if (!advance(state, actionCount)) {
+    // Count text/final responses too, but never revive a finished task merely
+    // to collect a snapshot. Pending input and tool availability gate checks,
+    // not decisions; this keeps live state and branch replay in agreement.
+    const canCheck = event.outcome === "completed" && hasTaskToolCall(event.message) &&
+      !ctx.hasPendingMessages() && pi.getActiveTools().includes(TOOL_NAME);
+    if (!advance(state, canCheck)) {
       return entries.length > event.entries.length ? { entries } : undefined;
     }
-    entries.push({ type: "custom", customType: CHECK_TYPE, data: { stage: state.stage } });
+    entries.push({ type: "custom", customType: CHECK_TYPE, data: { stage: state.stage, unit: "decision" } });
     awaitingSnapshot = true;
     injectSnapshotRequest = true;
     return { entries, continue: true };
