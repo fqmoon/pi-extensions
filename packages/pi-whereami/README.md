@@ -24,7 +24,7 @@ Checkpoints are kept in conversation history. The checkpoint tool itself is not 
 The extension also provides a HUD so the user can see the agent's latest recorded position and current status:
 
 ```text
-whereami · Decisions: 13/20 · Checkpoints: 1 · Checkpoint at decision 12
+WhereAmI · Decisions: 13/20 · Checkpoints: 1 · Checkpoint at decision 12
 ```
 
 `13/20` means model decision turns, not tool calls and not task-completion percentage. `Checkpoint at decision 12` means the latest recorded checkpoint was taken after the 12th decision.

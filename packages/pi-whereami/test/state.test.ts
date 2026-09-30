@@ -34,12 +34,12 @@ test("HUD parses durable checkpoints and ignores malformed history", () => {
 
 test("HUD shows the latest checkpoint decision and sanitizes only its display", () => {
   const state = { stage: 0, decisionsSinceCheck: 3 };
-  assert.deepEqual(formatHud(undefined, state, { decisions: 3, checkpoints: 0 }), ["whereami · Decisions: 3/20 · Checkpoints: 0 · No checkpoint yet"]);
-  assert.deepEqual(formatHud(undefined, { stage: 1, decisionsSinceCheck: 0 }, { decisions: 20, checkpoints: 0 }), ["whereami · Decisions: 20/35 · Checkpoints: 0 · No checkpoint yet"]);
+  assert.deepEqual(formatHud(undefined, state, { decisions: 3, checkpoints: 0 }), ["WhereAmI · Decisions: 3/20 · Checkpoints: 0 · No checkpoint yet"]);
+  assert.deepEqual(formatHud(undefined, { stage: 1, decisionsSinceCheck: 0 }, { decisions: 20, checkpoints: 0 }), ["WhereAmI · Decisions: 20/35 · Checkpoints: 0 · No checkpoint yet"]);
   const fields = { level: "module", scope: "\x1b[31mrenderer\x1b[0m", state: "dirty tracking", next: "inspect" };
   const hud = { fields, decision: 2 };
   const lines = formatHud(hud, state, { decisions: 3, checkpoints: 1 });
-  assert.equal(lines[0], "whereami · Decisions: 3/20 · Checkpoints: 1 · Checkpoint at decision 2");
+  assert.equal(lines[0], "WhereAmI · Decisions: 3/20 · Checkpoints: 1 · Checkpoint at decision 2");
   assert.equal(lines[1], "Level: module · Scope: renderer");
   assert.equal(fields.scope, "\x1b[31mrenderer\x1b[0m"); // Original durable data is untouched.
 });

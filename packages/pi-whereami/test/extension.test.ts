@@ -172,7 +172,7 @@ test("HUD stays visible between runs and keeps cumulative progress through succe
   await h.emit("agent_start");
   await h.emit("message_start", { message: { role: "user" } });
   assert.deepEqual(h.widgets.get("pi-whereami"), {
-    content: ["whereami · Decisions: 0/12 · Checkpoints: 0 · No checkpoint yet"], placement: "aboveEditor",
+    content: ["WhereAmI · Decisions: 0/12 · Checkpoints: 0 · No checkpoint yet"], placement: "aboveEditor",
   });
   await h.decisions(3);
   assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 3\/12 · Checkpoints: 0/);
@@ -180,7 +180,7 @@ test("HUD stays visible between runs and keeps cumulative progress through succe
   assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 12\/20 · Checkpoints: 0 · No checkpoint yet/);
   await collectCheckpoint(h);
   assert.deepEqual(h.widgets.get("pi-whereami")?.content, [
-    "whereami · Decisions: 12/20 · Checkpoints: 1 · Checkpoint at decision 12", "Level: module · Scope: renderer",
+    "WhereAmI · Decisions: 12/20 · Checkpoints: 1 · Checkpoint at decision 12", "Level: module · Scope: renderer",
     "State: dirty propagation is likely", "Next: inspect invalidation",
   ]);
   assert.deepEqual(restoreHudProgress(h.ctx.sessionManager.getBranch()), { decisions: 12, checkpoints: 1 });
@@ -219,7 +219,7 @@ test("new user input resets HUD counts and fields; failed collection leaves fiel
   const user = { role: "user", content: [{ type: "text", text: "new task" }], timestamp: Date.now() };
   h.ctx.sessionManager.appendMessage(user);
   await h.emit("message_start", { message: user });
-  const emptyContent = ["whereami · Decisions: 0/12 · Checkpoints: 0 · No checkpoint yet"];
+  const emptyContent = ["WhereAmI · Decisions: 0/12 · Checkpoints: 0 · No checkpoint yet"];
   assert.deepEqual(h.widgets.get("pi-whereami")?.content, emptyContent);
   await h.emit("agent_start");
   assert.deepEqual(h.widgets.get("pi-whereami")?.content, emptyContent);
@@ -227,7 +227,7 @@ test("new user input resets HUD counts and fields; failed collection leaves fiel
   const malformed = await h.tool.execute("bad-hud", { level: "module" });
   await h.boundary([{ toolName: TOOL_NAME, details: malformed.details }]);
   assert.deepEqual(h.widgets.get("pi-whereami")?.content, [
-    "whereami · Decisions: 12/20 · Checkpoints: 0 · No checkpoint yet",
+    "WhereAmI · Decisions: 12/20 · Checkpoints: 0 · No checkpoint yet",
   ]);
   await h.decisions(8);
   await collectCheckpoint(h, "new task");
@@ -254,7 +254,7 @@ test("HUD restores active-branch counts while staying hidden until execution res
   assert.match(resumed.widgets.get("pi-whereami")!.content[1], /Scope: renderer/);
   h.ctx.sessionManager.branch(beforeCheckpoint);
   await resumed.emit("session_tree");
-  assert.deepEqual(resumed.widgets.get("pi-whereami")?.content, ["whereami · Decisions: 12/20 · Checkpoints: 0 · No checkpoint yet"]);
+  assert.deepEqual(resumed.widgets.get("pi-whereami")?.content, ["WhereAmI · Decisions: 12/20 · Checkpoints: 0 · No checkpoint yet"]);
   await resumed.emit("agent_end");
   await resumed.emit("session_tree");
   assert.equal(resumed.widgets.size, 0);
@@ -281,7 +281,7 @@ test("resume and tree navigation keep fields aligned with checkpoints since the 
   const malformed = await h.tool.execute("bad-hud", { level: "module" });
   await h.boundary([{ toolName: TOOL_NAME, details: malformed.details }]);
   const withoutCheckpoint = h.ctx.sessionManager.getLeafId();
-  const emptyContent = ["whereami · Decisions: 12/20 · Checkpoints: 0 · No checkpoint yet"];
+  const emptyContent = ["WhereAmI · Decisions: 12/20 · Checkpoints: 0 · No checkpoint yet"];
   const resumed = harness(h.ctx.sessionManager);
   await resumed.emit("session_start");
   await resumed.emit("agent_start");
@@ -318,7 +318,7 @@ test("errors, aborts, and collection cancellation retain the HUD without a pendi
     await h.emit("agent_end");
     await h.emit("agent_before_settle");
     assert.deepEqual(h.widgets.get("pi-whereami")?.content, [
-      "whereami · Decisions: 11/12 · Checkpoints: 0 · No checkpoint yet",
+      "WhereAmI · Decisions: 11/12 · Checkpoints: 0 · No checkpoint yet",
     ]);
     await h.emit("agent_start");
     await h.decisions(1);
@@ -326,7 +326,7 @@ test("errors, aborts, and collection cancellation retain the HUD without a pendi
     await h.emit("agent_end");
     await h.emit("agent_before_settle");
     assert.deepEqual(h.widgets.get("pi-whereami")?.content, [
-      "whereami · Decisions: 12/20 · Checkpoints: 0 · No checkpoint yet",
+      "WhereAmI · Decisions: 12/20 · Checkpoints: 0 · No checkpoint yet",
     ]);
   }
 });

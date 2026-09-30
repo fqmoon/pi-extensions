@@ -24,7 +24,7 @@ Checkpoint 会保存在会话历史中。Checkpoint 工具本身不受周期触�
 除此之外，插件还提供一个 HUD 面板，让用户也能看到 Agent 当前记录的位置和运行状态：
 
 ```text
-whereami · Decisions: 13/20 · Checkpoints: 1 · Checkpoint at decision 12
+WhereAmI · Decisions: 13/20 · Checkpoints: 1 · Checkpoint at decision 12
 ```
 
 `13/20` 表示模型决策次数，不是工具调用数，也不是任务完成度；`Checkpoint at decision 12` 表示最新 checkpoint 记录在第 12 次决策之后。
