@@ -56,16 +56,13 @@ export default function (pi: ExtensionAPI) {
   let injectSnapshotRequest = false;
   let hudSnapshot: HudSnapshot | undefined;
   let hudProgress = freshHudProgress();
-  let running = false;
+  let hudVisible = false;
   let collectionTarget: number | undefined;
 
   const updateHud = (ctx: ExtensionContext, clear = false) => {
     if (!ctx.hasUI) return;
     try {
-      const lines = clear || !running ? undefined : formatHud(hudSnapshot, state, hudProgress, awaitingSnapshot, collectionTarget);
-      if (lines && hudSnapshot?.previousInput) {
-        for (let i = 1; i < lines.length; i++) lines[i] = ctx.ui.theme.fg("muted", lines[i]);
-      }
+      const lines = clear || !hudVisible ? undefined : formatHud(hudSnapshot, state, hudProgress, awaitingSnapshot, collectionTarget);
       ctx.ui.setWidget("pi-whereami", lines, { placement: "aboveEditor" });
     } catch {
       // UI rendering must never prevent a trigger or snapshot from persisting.
@@ -80,6 +77,7 @@ export default function (pi: ExtensionAPI) {
   const reset = () => {
     state = freshState();
     hudProgress = freshHudProgress();
+    hudSnapshot = undefined;
     clearRequest();
   };
   const restore = (branch: Parameters<typeof restoreState>[0]) => {
@@ -90,7 +88,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const onSessionPath = (ctx: ExtensionContext) => {
-    running = !ctx.isIdle();
+    hudVisible = !ctx.isIdle();
     const branch = ctx.sessionManager.getBranch();
     restore(branch);
     hudSnapshot = restoreHudSnapshot(branch);
@@ -102,11 +100,11 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_tree", (_event, ctx) => onSessionPath(ctx));
   pi.on("session_shutdown", (_event, ctx) => updateHud(ctx, true));
   pi.on("agent_start", (_event, ctx) => {
-    running = true;
+    hudVisible = true;
     updateHud(ctx);
   });
   pi.on("agent_end", (_event, ctx) => {
-    running = false;
+    // Keep the last position visible between runs.
     updateHud(ctx);
   });
 
@@ -114,7 +112,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_start", (event, ctx) => {
     if (event.message.role === "user") {
       reset();
-      if (hudSnapshot) hudSnapshot.previousInput = true;
       updateHud(ctx);
     }
   });
@@ -180,7 +177,7 @@ export default function (pi: ExtensionAPI) {
         entries.push({ type: "custom_message", customType: SNAPSHOT_TYPE, content: snapshot, display: true });
         const fields = parseSnapshot(snapshot);
         if (fields) {
-          hudSnapshot = { fields, previousInput: false };
+          hudSnapshot = { fields };
           hudProgress.snapshots++;
         }
       }

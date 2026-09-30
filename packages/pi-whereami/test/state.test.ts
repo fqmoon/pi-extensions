@@ -23,9 +23,11 @@ test("HUD parses durable snapshots and ignores malformed history", () => {
     formatSnapshot(fields)!.replace("State: dirty tracking", `State: ${"x".repeat(161)}`)]) {
     assert.equal(parseSnapshot(invalid), undefined);
   }
-  assert.deepEqual(restoreHudSnapshot([snapshot, user, { type: "custom_message", customType: SNAPSHOT_TYPE, content: "bad" }] as any),
-    { fields, previousInput: true });
-  assert.deepEqual(restoreHudSnapshot([snapshot, user, snapshot] as any), { fields, previousInput: false });
+  const malformed = { type: "custom_message", customType: SNAPSHOT_TYPE, content: "bad" };
+  assert.deepEqual(restoreHudSnapshot([snapshot, malformed] as any), { fields });
+  assert.equal(restoreHudSnapshot([snapshot, user] as any), undefined);
+  assert.equal(restoreHudSnapshot([snapshot, user, malformed] as any), undefined);
+  assert.deepEqual(restoreHudSnapshot([snapshot, user, snapshot] as any), { fields });
   assert.equal(restoreHudSnapshot([user] as any), undefined);
 });
 
@@ -34,10 +36,10 @@ test("HUD shows waiting progress without inventing fields and sanitizes only its
   assert.deepEqual(formatHud(undefined, state, { decisions: 3, snapshots: 0 }, false), ["whereami · Decisions: 3/12 · Snapshots: 0 · Awaiting first snapshot"]);
   assert.deepEqual(formatHud(undefined, { stage: 1, decisionsSinceCheck: 0 }, { decisions: 12, snapshots: 0 }, true), ["whereami · Decisions: 12/12 · Snapshots: 0 · Updating snapshot"]);
   const fields = { level: "module", scope: "\x1b[31mrenderer\x1b[0m", state: "dirty tracking", next: "inspect" };
-  const hud = { fields, previousInput: true };
-  const lines = formatHud(hud, state, { decisions: 3, snapshots: 0 }, false);
-  assert.equal(lines[0], "whereami · Decisions: 3/12 · Snapshots: 0 · Awaiting current snapshot");
-  assert.equal(lines[1], "History · Level: module · Scope: renderer");
+  const hud = { fields };
+  const lines = formatHud(hud, state, { decisions: 3, snapshots: 1 }, false);
+  assert.equal(lines[0], "whereami · Decisions: 3/12 · Snapshots: 1 · Latest snapshot");
+  assert.equal(lines[1], "Level: module · Scope: renderer");
   assert.equal(fields.scope, "\x1b[31mrenderer\x1b[0m"); // Original durable data is untouched.
 });
 

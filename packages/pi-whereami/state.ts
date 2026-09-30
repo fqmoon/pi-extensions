@@ -115,7 +115,6 @@ export interface SnapshotFields {
 
 export interface HudSnapshot {
   fields: Required<SnapshotFields>;
-  previousInput: boolean;
 }
 
 /** Read only the plugin's fixed durable format; malformed history is skipped. */
@@ -127,15 +126,15 @@ export function parseSnapshot(content: unknown): Required<SnapshotFields> | unde
   return formatSnapshot(fields) ? fields : undefined;
 }
 
-/** The HUD follows the current branch, never a snapshot from a sibling path. */
+/** Read the latest valid snapshot after the current branch's latest user input. */
 export function restoreHudSnapshot(branch: readonly SessionEntry[]): HudSnapshot | undefined {
   let snapshot: HudSnapshot | undefined;
   for (const entry of branch) {
     if (entry.type === "message" && entry.message.role === "user") {
-      if (snapshot) snapshot.previousInput = true;
+      snapshot = undefined;
     } else if (entry.type === "custom_message" && entry.customType === SNAPSHOT_TYPE) {
       const fields = parseSnapshot(entry.content);
-      if (fields) snapshot = { fields, previousInput: false };
+      if (fields) snapshot = { fields };
     }
   }
   return snapshot;
@@ -147,9 +146,7 @@ export function formatHud(snapshot: HudSnapshot | undefined, triggerState: Trigg
   // was delayed. The next target uses the actual last check and stage interval.
   const target = updating ? collectionTarget
     : progress.decisions - triggerState.decisionsSinceCheck + INTERVALS[triggerState.stage];
-  const title = updating ? "Updating snapshot" : !snapshot || snapshot.previousInput
-    ? `Awaiting ${snapshot ? "current" : "first"} snapshot`
-    : "Latest snapshot";
+  const title = updating ? "Updating snapshot" : snapshot ? "Latest snapshot" : "Awaiting first snapshot";
   const header = `whereami · Decisions: ${progress.decisions}/${target} · Snapshots: ${progress.snapshots} · ${title}`;
   if (!snapshot) return [header];
   // Keep terminal control sequences out of the widget. The durable snapshot
@@ -158,7 +155,7 @@ export function formatHud(snapshot: HudSnapshot | undefined, triggerState: Trigg
   const { level, scope, state, next } = snapshot.fields;
   return [
     header,
-    `${snapshot.previousInput ? "History · " : ""}Level: ${plain(level)} · Scope: ${plain(scope)}`,
+    `Level: ${plain(level)} · Scope: ${plain(scope)}`,
     `State: ${plain(state)}`,
     `Next: ${plain(next)}`,
   ];

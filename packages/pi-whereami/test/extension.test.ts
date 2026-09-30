@@ -114,7 +114,7 @@ async function collectSnapshot(h: ReturnType<typeof harness>, scope = "renderer"
   return h.boundary([{ toolName: TOOL_NAME, toolCallId: "hud-sample", isError: false, details: recorded.details }]);
 }
 
-test("HUD is execution-only and keeps cumulative progress through successful snapshots", async () => {
+test("HUD stays visible between runs and keeps cumulative progress through successful snapshots", async () => {
   const h = harness();
   await h.emit("session_start");
   assert.equal(h.widgets.size, 0);
@@ -146,13 +146,18 @@ test("HUD is execution-only and keeps cumulative progress through successful sna
   assert.match(h.widgets.get("pi-whereami")!.content[1], /Scope: pipeline/);
   assert.equal(snapshots().length, 2);
   await h.boundary([], "completed", [{ type: "text", text: "Finished." }]);
+  const lastWidget = h.widgets.get("pi-whereami");
   await h.emit("agent_end");
-  assert.equal(h.widgets.size, 0);
+  assert.deepEqual(h.widgets.get("pi-whereami"), lastWidget);
   await h.emit("agent_before_settle");
-  assert.equal(h.widgets.size, 0); // Settlement must not re-show the stopped panel.
+  assert.deepEqual(h.widgets.get("pi-whereami"), lastWidget);
+  await h.emit("agent_start");
+  assert.deepEqual(h.widgets.get("pi-whereami"), lastWidget);
+  await h.emit("session_shutdown");
+  assert.equal(h.widgets.size, 0);
 });
 
-test("new user input resets both HUD counts; failed collection preserves actual progress", async () => {
+test("new user input resets HUD counts and fields; failed collection leaves fields empty", async () => {
   const h = harness();
   await h.emit("session_start");
   await h.emit("agent_start");
@@ -161,21 +166,26 @@ test("new user input resets both HUD counts; failed collection preserves actual 
   await h.emit("message_start", { message: { role: "custom" } });
   assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 12\/20 · Snapshots: 1/);
   await h.emit("agent_end");
-  await h.emit("message_start", { message: { role: "user" } });
-  assert.equal(h.widgets.size, 0); // Delivery alone does not imply execution.
+  const user = { role: "user", content: [{ type: "text", text: "new task" }], timestamp: Date.now() };
+  h.ctx.sessionManager.appendMessage(user);
+  await h.emit("message_start", { message: user });
+  const emptyContent = ["whereami · Decisions: 0/12 · Snapshots: 0 · Awaiting first snapshot"];
+  assert.deepEqual(h.widgets.get("pi-whereami")?.content, emptyContent);
   await h.emit("agent_start");
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 0\/12 · Snapshots: 0 · Awaiting current snapshot/);
-  assert.match(h.widgets.get("pi-whereami")!.content[1], /^History/);
+  assert.deepEqual(h.widgets.get("pi-whereami")?.content, emptyContent);
   await h.decisions(12);
   const malformed = await h.tool.execute("bad-hud", { level: "module" });
   await h.boundary([{ toolName: TOOL_NAME, details: malformed.details }]);
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 12\/20 · Snapshots: 0 · Awaiting current snapshot/);
+  assert.deepEqual(h.widgets.get("pi-whereami")?.content, [
+    "whereami · Decisions: 12/20 · Snapshots: 0 · Awaiting first snapshot",
+  ]);
   await h.decisions(8);
   await collectSnapshot(h, "new task");
   assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 20\/26 · Snapshots: 1 · Latest snapshot/);
   assert.match(h.widgets.get("pi-whereami")!.content[1], /^Level:.*Scope: new task/);
+  const lastWidget = h.widgets.get("pi-whereami");
   await h.emit("agent_end");
-  assert.equal(h.widgets.size, 0);
+  assert.deepEqual(h.widgets.get("pi-whereami"), lastWidget);
 });
 
 test("HUD restores active-branch counts while staying hidden until execution resumes", async () => {
@@ -207,7 +217,47 @@ test("HUD restores active-branch counts while staying hidden until execution res
   assert.equal(resumed.widgets.size, 0);
 });
 
-test("errors, aborts, and collection cancellation cannot leave the HUD visible after execution", async () => {
+test("resume and tree navigation keep fields aligned with snapshots since the latest user input", async () => {
+  const h = harness();
+  await h.emit("session_start");
+  await h.emit("agent_start");
+  await h.decisions(12);
+  await collectSnapshot(h, "old task");
+  const oldTask = h.ctx.sessionManager.getLeafId();
+  const user = { role: "user", content: [{ type: "text", text: "new task" }], timestamp: Date.now() };
+  h.ctx.sessionManager.appendMessage(user);
+  await h.emit("message_start", { message: user });
+  await h.decisions(12);
+  const malformed = await h.tool.execute("bad-hud", { level: "module" });
+  await h.boundary([{ toolName: TOOL_NAME, details: malformed.details }]);
+  const withoutSnapshot = h.ctx.sessionManager.getLeafId();
+  const emptyContent = ["whereami · Decisions: 12/20 · Snapshots: 0 · Awaiting first snapshot"];
+  const resumed = harness(h.ctx.sessionManager);
+  await resumed.emit("session_start");
+  await resumed.emit("agent_start");
+  assert.deepEqual(resumed.widgets.get("pi-whereami")?.content, emptyContent);
+  assert.equal(h.ctx.sessionManager.getBranch().filter((entry: any) => entry.customType === SNAPSHOT_TYPE).length, 1);
+
+  h.ctx.sessionManager.branch(oldTask);
+  await resumed.emit("session_tree");
+  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Snapshots: 1 · Latest snapshot/);
+  assert.match(resumed.widgets.get("pi-whereami")!.content[1], /Scope: old task/);
+  h.ctx.sessionManager.branch(withoutSnapshot);
+  await resumed.emit("session_tree");
+  assert.deepEqual(resumed.widgets.get("pi-whereami")?.content, emptyContent);
+  await resumed.decisions(8);
+  await collectSnapshot(resumed, "new task");
+  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Snapshots: 1 · Latest snapshot/);
+  assert.match(resumed.widgets.get("pi-whereami")!.content[1], /Scope: new task/);
+  const latestWidget = resumed.widgets.get("pi-whereami");
+  await resumed.decisions(6);
+  const invalid = await resumed.tool.execute("bad-hud", { level: "module" });
+  await resumed.boundary([{ toolName: TOOL_NAME, details: invalid.details }]);
+  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Snapshots: 1 · Latest snapshot/);
+  assert.deepEqual(resumed.widgets.get("pi-whereami")!.content.slice(1), latestWidget!.content.slice(1));
+});
+
+test("errors, aborts, and collection cancellation retain the HUD without a pending update", async () => {
   for (const outcome of ["error", "aborted"]) {
     const h = harness();
     await h.emit("session_start");
@@ -217,13 +267,17 @@ test("errors, aborts, and collection cancellation cannot leave the HUD visible a
     assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 11\/12/);
     await h.emit("agent_end");
     await h.emit("agent_before_settle");
-    assert.equal(h.widgets.size, 0);
+    assert.deepEqual(h.widgets.get("pi-whereami")?.content, [
+      "whereami · Decisions: 11/12 · Snapshots: 0 · Awaiting first snapshot",
+    ]);
     await h.emit("agent_start");
     await h.decisions(1);
     assert.match(h.widgets.get("pi-whereami")!.content[0], /Updating snapshot/);
     await h.emit("agent_end");
     await h.emit("agent_before_settle");
-    assert.equal(h.widgets.size, 0);
+    assert.deepEqual(h.widgets.get("pi-whereami")?.content, [
+      "whereami · Decisions: 12/20 · Snapshots: 0 · Awaiting first snapshot",
+    ]);
   }
 });
 
