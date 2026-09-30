@@ -21,6 +21,8 @@ Next: inspect the dirty propagation boundary
 
 Checkpoint 会保存在会话历史中。Checkpoint 工具本身不受周期触发窗口限制：只要调用参数合法，就会立即记录并更新 HUD；主动记录 checkpoint 也不会重置或推进 re-orientation 的计数。
 
+四个字段都必须是非空的单行字符串。应尽量简短，但不会因为稍长而拒绝记录：历史保留完整文本，HUD 每个字段最多显示 160 个 Unicode 字符，截断时包含省略号。参数无效时，工具错误会说明具体字段和原因；插件不会强制重试。
+
 除此之外，插件还提供一个 HUD 面板，让用户也能看到 Agent 当前记录的位置和运行状态：
 
 ```text

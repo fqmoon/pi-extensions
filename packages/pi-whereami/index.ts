@@ -4,6 +4,7 @@ import { Type } from "@earendil-works/pi-ai";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   advance,
+  checkpointValidationError,
   formatCheckpoint,
   formatHud,
   freshState,
@@ -37,7 +38,8 @@ Do not change direction merely because this check occurred.`;
 
 const CHECKPOINT_PROTOCOL = `After re-orienting, call ${TOOL_NAME} exactly once.
 Record a brief progress checkpoint: the position you now hold, not your reasoning process.
-Use one short sentence per field: Level (repo/subsystem/module/call-chain/file/symbol), Scope, State, Next.
+Use one short, single-line sentence per field: Level (repo/subsystem/module/call-chain/file/symbol), Scope, State, Next.
+Summarize concepts and the current understanding rather than listing code identifiers or every reference.
 Do not report the re-orientation analysis separately. Continue the original task after the checkpoint.`;
 
 function loadReorientationPrompt(): string {
@@ -141,17 +143,19 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: TOOL_NAME,
     label: "Checkpoint",
-    description: "Record a brief progress checkpoint at any time. Not a task action.",
+    description: "Record a brief progress checkpoint at any time. Use short, non-empty, single-line fields. Not a task action.",
     parameters: Type.Object({
-      level: Type.String({ description: "Current abstraction level" }),
-      scope: Type.String({ description: "Current problem area" }),
-      state: Type.String({ description: "Current understanding, not reasoning" }),
-      next: Type.String({ description: "Next key action" }),
+      level: Type.String({ description: "Current abstraction level; one short, non-empty line" }),
+      scope: Type.String({ description: "Current problem area; one short, non-empty line" }),
+      state: Type.String({ description: "Current understanding, not reasoning; one short, non-empty line" }),
+      next: Type.String({ description: "Next key action; one short, non-empty line" }),
     }),
     async execute(_toolCallId, params) {
+      const error = checkpointValidationError(params);
+      if (error) throw new Error(`Invalid checkpoint: ${error}. Continue the task.`);
       const checkpoint = formatCheckpoint(params);
       return {
-        content: [{ type: "text", text: checkpoint ? "Checkpoint recorded; continue the task." : "Invalid checkpoint; continue the task." }],
+        content: [{ type: "text", text: "Checkpoint recorded; continue the task." }],
         details: { checkpoint },
       };
     },

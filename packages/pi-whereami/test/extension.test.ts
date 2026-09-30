@@ -100,6 +100,14 @@ function harness(sessionManager = SessionManager.inMemory("/tmp"), agentDir = de
     }
     return result;
   };
+  // Match the host's conversion of thrown execution errors into failed results.
+  const execute = async (id: string, params: any) => {
+    try {
+      return await tool.execute(id, params);
+    } catch (error) {
+      return { content: [{ type: "text", text: (error as Error).message }], details: {}, isError: true };
+    }
+  };
   const actions = (n: number) => Array.from({ length: n }, (_, i) => ({ role: "toolResult", toolName: "read", toolCallId: `id-${i}`, isError: false }));
   const decisions = async (n: number, outcome = "completed") => {
     let result;
@@ -109,7 +117,7 @@ function harness(sessionManager = SessionManager.inMemory("/tmp"), agentDir = de
     }
     return result;
   };
-  return { ctx, emit, boundary, actions, decisions, widgets, setWidgetError(error: boolean) { widgetError = error; }, setToolAvailable(available: boolean) { toolAvailable = available; }, setPendingMessages(pending: boolean) { pendingMessages = pending; }, get tool() { return tool; } };
+  return { ctx, emit, boundary, execute, actions, decisions, widgets, setWidgetError(error: boolean) { widgetError = error; }, setToolAvailable(available: boolean) { toolAvailable = available; }, setPendingMessages(pending: boolean) { pendingMessages = pending; }, get tool() { return tool; } };
 }
 
 async function collectCheckpoint(h: ReturnType<typeof harness>, scope = "renderer") {
@@ -120,6 +128,66 @@ async function collectCheckpoint(h: ReturnType<typeof harness>, scope = "rendere
   assert.equal(recorded.content[0].text, "Checkpoint recorded; continue the task.");
   return h.boundary([{ toolName: TOOL_NAME, toolCallId: "hud-sample", isError: false, details: recorded.details }]);
 }
+
+// Original arguments from the checkpoint rejected on 2026-09-30 (state: 179 characters).
+const longCheckpoint = {
+  level: "repo/双包架构（sdk + app）",
+  scope: "将 sdk/src/paper.wgsl 移入 app，SDK 仅保留唯一默认 stroke shader",
+  state: "已定位全部引用链：SDK 内 layer._installBuiltinPaper、renderer.paperPipeline、render-pipeline/webgpu-renderer/n1paper 三处测试；app 侧 newPaper 后 layer0 shader 由文件持久化回填，仅新建 Paper 路径需 app 注入网格 shader",
+  next: "确定 app→layer0 的 shader 注入机制（app 侧 newPaper 后 setShaderSource vs SDK 注入选项），再实施迁移",
+};
+
+test("the original 179-character checkpoint updates the HUD and survives session-file resume", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-whereami-long-"));
+  try {
+    const h = harness(SessionManager.create(dir, dir));
+    await h.emit("session_start");
+    await h.emit("agent_start");
+    assert.equal((await h.decisions(12))?.continue, true);
+    await h.emit("context", { messages: [] });
+    assert.equal(longCheckpoint.state.length, 179);
+    const recorded = await h.tool.execute("long", longCheckpoint);
+    assert.equal(recorded.content[0].text, "Checkpoint recorded; continue the task.");
+    const after = await h.boundary([{ toolName: TOOL_NAME, toolCallId: "long", isError: false, ...recorded }], "completed", [
+      { type: "thinking", thinking: "Re-orienting." },
+      { type: "toolCall", name: TOOL_NAME, id: "long", arguments: longCheckpoint },
+    ]);
+    assert.equal(after.continue, undefined);
+    const checkpoint = h.ctx.sessionManager.getBranch().find((entry: any) => entry.customType === CHECKPOINT_TYPE);
+    assert.equal(checkpoint.content, recorded.details.checkpoint);
+    assert.ok(checkpoint.content.includes(`State: ${longCheckpoint.state}`));
+    assert.deepEqual(restoreHudProgress(h.ctx.sessionManager.getBranch()), { decisions: 12, checkpoints: 1 });
+    const hud = h.widgets.get("pi-whereami")!.content;
+    assert.match(hud[0], /Checkpoint at decision 12/);
+    assert.equal(hud[1], `Level: ${longCheckpoint.level} · Scope: ${longCheckpoint.scope}`);
+    assert.equal(hud[2], `State: ${longCheckpoint.state.slice(0, 159)}…`);
+    assert.equal(hud[3], `Next: ${longCheckpoint.next}`);
+
+    const resumedManager = SessionManager.open(h.ctx.sessionManager.getSessionFile()!);
+    const resumedCheckpoint = resumedManager.getBranch().find((entry: any) => entry.customType === CHECKPOINT_TYPE);
+    assert.equal(resumedCheckpoint.content, recorded.details.checkpoint);
+    const resumed = harness(resumedManager);
+    await resumed.emit("session_start");
+    await resumed.emit("agent_start");
+    assert.deepEqual(resumed.widgets.get("pi-whereami")!.content, hud);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("invalid checkpoint execution names the field and reason as a tool error", async () => {
+  const h = harness();
+  for (const [params, reason] of [
+    [{ level: "module", scope: "renderer", next: "inspect" }, 'missing field "state"'],
+    [{ ...longCheckpoint, state: " \t " }, 'field "state" must not be empty'],
+    [{ ...longCheckpoint, next: "read\nthen edit" }, 'field "next" must be a single line'],
+  ] as const) {
+    await assert.rejects(h.tool.execute("bad", params), { message: `Invalid checkpoint: ${reason}. Continue the task.` });
+    const result = await h.execute("bad", params);
+    assert.equal(result.isError, true);
+    assert.equal(result.content[0].text, `Invalid checkpoint: ${reason}. Continue the task.`);
+  }
+});
 
 test("checkpoint records outside a re-orientation window without advancing decision progress", async () => {
   const h = harness();
@@ -224,8 +292,8 @@ test("new user input resets HUD counts and fields; failed collection leaves fiel
   await h.emit("agent_start");
   assert.deepEqual(h.widgets.get("pi-whereami")?.content, emptyContent);
   await h.decisions(12);
-  const malformed = await h.tool.execute("bad-hud", { level: "module" });
-  await h.boundary([{ toolName: TOOL_NAME, details: malformed.details }]);
+  const malformed = await h.execute("bad-hud", { level: "module" });
+  await h.boundary([{ toolName: TOOL_NAME, ...malformed }]);
   assert.deepEqual(h.widgets.get("pi-whereami")?.content, [
     "WhereAmI · Decisions: 12/20 · No checkpoint yet",
   ]);
@@ -278,8 +346,8 @@ test("resume and tree navigation keep fields aligned with checkpoints since the 
   h.ctx.sessionManager.appendMessage(user);
   await h.emit("message_start", { message: user });
   await h.decisions(12);
-  const malformed = await h.tool.execute("bad-hud", { level: "module" });
-  await h.boundary([{ toolName: TOOL_NAME, details: malformed.details }]);
+  const malformed = await h.execute("bad-hud", { level: "module" });
+  await h.boundary([{ toolName: TOOL_NAME, ...malformed }]);
   const withoutCheckpoint = h.ctx.sessionManager.getLeafId();
   const emptyContent = ["WhereAmI · Decisions: 12/20 · No checkpoint yet"];
   const resumed = harness(h.ctx.sessionManager);
@@ -301,8 +369,8 @@ test("resume and tree navigation keep fields aligned with checkpoints since the 
   assert.match(resumed.widgets.get("pi-whereami")!.content[1], /Scope: new task/);
   const latestWidget = resumed.widgets.get("pi-whereami");
   await resumed.decisions(6);
-  const invalid = await resumed.tool.execute("bad-hud", { level: "module" });
-  await resumed.boundary([{ toolName: TOOL_NAME, details: invalid.details }]);
+  const invalid = await resumed.execute("bad-hud", { level: "module" });
+  await resumed.boundary([{ toolName: TOOL_NAME, ...invalid }]);
   assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Checkpoint at decision 20/);
   assert.deepEqual(resumed.widgets.get("pi-whereami")!.content.slice(1), latestWidget!.content.slice(1));
 });
@@ -454,6 +522,8 @@ test("missing reorient.md uses the built-in strategy and fixed protocol", async 
   assert.match(prompt, /would resolve the important uncertainty more directly, prefer it\./);
   assert.match(prompt, /If the current path remains the best path, keep it\./);
   assert.match(prompt, /call whereami_checkpoint exactly once/);
+  assert.match(prompt, /short, single-line sentence per field/);
+  assert.match(prompt, /rather than listing code identifiers/);
   assert.match(prompt, /Level .* Scope, State, Next/);
 });
 
@@ -580,9 +650,10 @@ test("required fields and invalid or interrupted checks never force a retry", as
   assert.deepEqual(h.tool.parameters.required?.sort(), ["level", "next", "scope", "state"]);
   await h.emit("session_start");
   assert.equal((await h.decisions(12))?.continue, true);
-  const malformed = await h.tool.execute("bad", { level: "module", scope: "renderer", state: "x\ny", next: "inspect" });
+  const malformed = await h.execute("bad", { level: "module", scope: "renderer", state: "x\ny", next: "inspect" });
+  assert.equal(malformed.isError, true);
   assert.equal(malformed.details.checkpoint, undefined);
-  assert.equal((await h.boundary([{ toolName: TOOL_NAME, toolCallId: "bad", details: malformed.details }])).entries[0].customType, CHECK_RESPONSE_TYPE);
+  assert.equal((await h.boundary([{ toolName: TOOL_NAME, toolCallId: "bad", ...malformed }])).entries[0].customType, CHECK_RESPONSE_TYPE);
   assert.equal(h.ctx.sessionManager.getBranch().some((entry: any) => entry.customType === CHECKPOINT_TYPE), false);
   assert.equal((await h.emit("context", { messages: [] }))?.messages, undefined);
   assert.equal((await h.decisions(8))?.continue, true);
@@ -596,9 +667,10 @@ test("bad fields and failed checks do not interrupt the task; user resets at dee
   await h.emit("session_start");
   for (const n of [12, 8, 6, 4]) {
     assert.equal((await h.decisions(n))?.continue, true);
-    const malformed = await h.tool.execute("bad", { scope: "renderer" });
+    const malformed = await h.execute("bad", { scope: "renderer" });
+    assert.equal(malformed.isError, true);
     assert.equal(malformed.details.checkpoint, undefined);
-    assert.equal((await h.boundary([{ role: "toolResult", toolName: TOOL_NAME, isError: false, details: malformed.details }])).entries[0].customType, CHECK_RESPONSE_TYPE);
+    assert.equal((await h.boundary([{ role: "toolResult", toolName: TOOL_NAME, ...malformed }])).entries[0].customType, CHECK_RESPONSE_TYPE);
   }
   // A failed sampling turn (no tool called) is allowed to finish normally.
   assert.equal((await h.decisions(4))?.continue, true);

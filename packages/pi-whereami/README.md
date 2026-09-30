@@ -21,6 +21,8 @@ Next: inspect the dirty propagation boundary
 
 Checkpoints are kept in conversation history. The checkpoint tool itself is not gated by the periodic trigger: any valid checkpoint call is recorded immediately and shown in the HUD. Recording one does not reset or advance the re-orientation schedule.
 
+All four fields must be non-empty, single-line strings. Keep them brief, but longer fields are not rejected: history retains their full text, while the HUD shows at most 160 Unicode characters per field, including an ellipsis when truncated. Invalid fields produce a tool error naming the field and reason; the extension does not force a retry.
+
 The extension also provides a HUD so the user can see the agent's latest recorded position and current status:
 
 ```text

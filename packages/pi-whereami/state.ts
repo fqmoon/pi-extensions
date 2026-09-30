@@ -153,9 +153,13 @@ export function formatHud(checkpoint: HudCheckpoint | undefined, triggerState: T
   const status = checkpoint ? `Checkpoint at decision ${checkpoint.decision}` : "No checkpoint yet";
   const header = `WhereAmI · Decisions: ${progress.decisions}/${target} · ${status}`;
   if (!checkpoint) return [header];
-  // Keep terminal control sequences out of the widget. The durable checkpoint
-  // remains unchanged, and the host handles ordinary wrapping and styling.
-  const plain = (text: string) => stripVTControlCharacters(text).replace(/[\x00-\x1f\x7f-\x9f]/g, "");
+  // Sanitize and bound only the display. Keep full fields in durable history;
+  // the host handles ordinary wrapping and styling. Count Unicode code points
+  // so truncation cannot leave half of a surrogate pair in the widget.
+  const plain = (text: string) => {
+    const characters = Array.from(stripVTControlCharacters(text).replace(/[\x00-\x1f\x7f-\x9f]/g, ""));
+    return characters.length > 160 ? `${characters.slice(0, 159).join("")}…` : characters.join("");
+  };
   const { level, scope, state, next } = checkpoint.fields;
   return [
     header,
@@ -165,12 +169,21 @@ export function formatHud(checkpoint: HudCheckpoint | undefined, triggerState: T
   ];
 }
 
-/** Never invent a missing field or persist an unbounded progress report. */
-export function formatCheckpoint(fields: CheckpointFields): string | undefined {
-  const values = [fields.level, fields.scope, fields.state, fields.next];
-  if (values.some((value) => typeof value !== "string" || !value.trim() || value.length > 160 || /[\r\n]/.test(value))) {
-    return undefined;
+/** Validate the durable single-line format, not a display-length budget. */
+export function checkpointValidationError(fields: CheckpointFields): string | undefined {
+  for (const name of ["level", "scope", "state", "next"] as const) {
+    const value = fields[name];
+    if (value === undefined) return `missing field "${name}"`;
+    if (typeof value !== "string") return `field "${name}" must be a string`;
+    if (!value.trim()) return `field "${name}" must not be empty`;
+    if (/[\r\n\u2028\u2029]/.test(value)) return `field "${name}" must be a single line`;
   }
-  const [level, scope, state, next] = values.map((value) => value!.trim());
+  return undefined;
+}
+
+/** Never invent a missing field or truncate the recorded position. */
+export function formatCheckpoint(fields: CheckpointFields): string | undefined {
+  if (checkpointValidationError(fields)) return undefined;
+  const [level, scope, state, next] = [fields.level, fields.scope, fields.state, fields.next].map((value) => value!.trim());
   return `[whereami checkpoint]\n\nLevel: ${level}\nScope: ${scope}\nState: ${state}\nNext: ${next}`;
 }

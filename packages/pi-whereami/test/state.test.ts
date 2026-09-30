@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  advance, formatCheckpoint, formatHud, parseCheckpoint, restoreHudCheckpoint, freshHudProgress, restoreHudProgress, freshState, DEFAULT_INTERVALS, intervalAt, hasTaskToolCall, isDecision,
+  advance, checkpointValidationError, formatCheckpoint, formatHud, parseCheckpoint, restoreHudCheckpoint, freshHudProgress, restoreHudProgress, freshState, DEFAULT_INTERVALS, intervalAt, hasTaskToolCall, isDecision,
   CHECK_TYPE, CHECK_RESPONSE_TYPE, REQUEST_TYPE, restoreState, CHECKPOINT_TYPE, TOOL_NAME,
 } from "../state.ts";
 
@@ -21,7 +21,7 @@ test("HUD parses durable checkpoints and ignores malformed history", () => {
   const checkpoint = { type: "custom_message", customType: CHECKPOINT_TYPE, content: formatCheckpoint(fields) };
   assert.deepEqual(parseCheckpoint(checkpoint.content), fields);
   for (const invalid of [undefined, [], "[whereami checkpoint]\n\nLevel: module", formatCheckpoint(fields)!.replace("Scope: renderer", "Scope: "),
-    formatCheckpoint(fields)!.replace("State: dirty tracking", `State: ${"x".repeat(161)}`)]) {
+    formatCheckpoint(fields)!.replace("State: dirty tracking", "State: dirty\ntracking")]) {
     assert.equal(parseCheckpoint(invalid), undefined);
   }
   const malformed = { type: "custom_message", customType: CHECKPOINT_TYPE, content: "bad" };
@@ -30,6 +30,26 @@ test("HUD parses durable checkpoints and ignores malformed history", () => {
   assert.equal(restoreHudCheckpoint([checkpoint, user, malformed] as any), undefined);
   assert.deepEqual(restoreHudCheckpoint([checkpoint, user, checkpoint] as any), { fields, decision: 0 });
   assert.equal(restoreHudCheckpoint([user] as any), undefined);
+});
+
+test("long fields are preserved in history while only their HUD display is bounded", () => {
+  const fields = { level: "层".repeat(161), scope: "s".repeat(200), state: "🧭".repeat(161), next: "n".repeat(1000) };
+  const content = formatCheckpoint(fields)!;
+  assert.ok(content);
+  assert.deepEqual(parseCheckpoint(content), fields);
+  const branch = [{ type: "custom_message", customType: CHECKPOINT_TYPE, content }];
+  const checkpoint = restoreHudCheckpoint(branch as any)!;
+  assert.deepEqual(checkpoint.fields, fields);
+  assert.deepEqual(formatHud(checkpoint, freshState(), { decisions: 0, checkpoints: 1 }).slice(1), [
+    `Level: ${"层".repeat(159)}… · Scope: ${"s".repeat(159)}…`,
+    `State: ${"🧭".repeat(159)}…`,
+    `Next: ${"n".repeat(159)}…`,
+  ]);
+  assert.deepEqual(checkpoint.fields, fields);
+  const exactBudget = { ...fields, state: "🧭".repeat(160) };
+  assert.equal(formatHud({ fields: exactBudget, decision: 0 }, freshState(), freshHudProgress())[2], `State: ${exactBudget.state}`);
+  const colored = { ...fields, state: `\x1b[31m${fields.state}\x1b[0m` };
+  assert.equal(formatHud({ fields: colored, decision: 0 }, freshState(), freshHudProgress())[2], `State: ${"🧭".repeat(159)}…`);
 });
 
 test("HUD shows the latest checkpoint decision and sanitizes only its display", () => {
@@ -139,7 +159,20 @@ test("invalid checkpoint fields are skipped, not filled in by the extension", ()
     "[whereami checkpoint]\n\nLevel: module\nScope: renderer\nState: likely dirty tracking\nNext: inspect boundary");
   assert.equal(formatCheckpoint({ level: "file", scope: "renderer", state: "", next: "read" }), undefined);
   assert.equal(formatCheckpoint({ level: "file", scope: "renderer\nother", state: "x", next: "read" }), undefined);
-  assert.equal(formatCheckpoint({ level: "file", scope: "renderer", state: "x", next: "x".repeat(161) }), undefined);
+  for (const name of ["level", "scope", "state", "next"] as const) {
+    const valid = { level: "file", scope: "renderer", state: "x", next: "read" };
+    assert.equal(checkpointValidationError({ ...valid, [name]: undefined }), `missing field "${name}"`);
+    assert.equal(checkpointValidationError({ ...valid, [name]: 42 } as any), `field "${name}" must be a string`);
+    assert.equal(checkpointValidationError({ ...valid, [name]: " \t " }), `field "${name}" must not be empty`);
+    for (const value of ["x\ny", "x\ry", "x\u2028y", "x\u2029y"]) {
+      const fields = { ...valid, [name]: value };
+      assert.equal(checkpointValidationError(fields), `field "${name}" must be a single line`);
+      assert.equal(formatCheckpoint(fields), undefined);
+      const content = formatCheckpoint(valid)!.replace(`${name[0].toUpperCase()}${name.slice(1)}: ${valid[name]}`, `${name[0].toUpperCase()}${name.slice(1)}: ${value}`);
+      assert.equal(parseCheckpoint(content), undefined);
+    }
+    assert.equal(checkpointValidationError({ ...valid, [name]: "x".repeat(1000) }), undefined);
+  }
 });
 
 test("HUD replay shares decision exemptions and counts only valid checkpoints after the latest user input", () => {
