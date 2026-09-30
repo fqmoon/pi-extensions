@@ -57,12 +57,11 @@ export default function (pi: ExtensionAPI) {
   let hudCheckpoint: HudCheckpoint | undefined;
   let hudProgress = freshHudProgress();
   let hudVisible = false;
-  let collectionTarget: number | undefined;
 
   const updateHud = (ctx: ExtensionContext, clear = false) => {
     if (!ctx.hasUI) return;
     try {
-      const lines = clear || !hudVisible ? undefined : formatHud(hudCheckpoint, state, hudProgress, collectingRequestedCheckpoint, collectionTarget);
+      const lines = clear || !hudVisible ? undefined : formatHud(hudCheckpoint, state, hudProgress);
       ctx.ui.setWidget("pi-whereami", lines, { placement: "aboveEditor" });
     } catch {
       // UI rendering must never prevent a trigger or checkpoint from persisting.
@@ -72,7 +71,6 @@ export default function (pi: ExtensionAPI) {
   const clearCollection = () => {
     collectingRequestedCheckpoint = false;
     injectCheckpointRequest = false;
-    collectionTarget = undefined;
   };
   const reset = () => {
     state = freshState();
@@ -148,6 +146,8 @@ export default function (pi: ExtensionAPI) {
     // a custom message between a tool call and its result (invalid on replay).
     const entries = [...event.entries];
     const checkpointRequested = collectingRequestedCheckpoint;
+    const currentTurnIsDecision = isDecision(event.message, checkpointRequested);
+    const checkpointDecision = hudProgress.decisions + (currentTurnIsDecision ? 1 : 0);
     if (checkpointRequested) {
       entries.push({ type: "custom", customType: CHECK_RESPONSE_TYPE, data: { messageEntryId: event.messageEntryId } });
     }
@@ -183,7 +183,7 @@ export default function (pi: ExtensionAPI) {
         entries.push({ type: "custom_message", customType: CHECKPOINT_TYPE, content: checkpoint, display: true });
         const fields = parseCheckpoint(checkpoint);
         if (fields) {
-          hudCheckpoint = { fields };
+          hudCheckpoint = { fields, decision: checkpointDecision };
           hudProgress.checkpoints++;
         }
       }
@@ -193,7 +193,7 @@ export default function (pi: ExtensionAPI) {
     // gates later checkpoint calls.
     if (checkpointRequested) clearCollection();
 
-    if (!isDecision(event.message, checkpointRequested)) {
+    if (!currentTurnIsDecision) {
       updateHud(ctx);
       return entries.length > event.entries.length ? { entries } : undefined;
     }
@@ -202,7 +202,6 @@ export default function (pi: ExtensionAPI) {
     // not decisions; this keeps live state and branch replay in agreement.
     const canCheck = event.outcome === "completed" && hasTaskToolCall(event.message) &&
       !ctx.hasPendingMessages() && pi.getActiveTools().includes(TOOL_NAME);
-    const target = hudProgress.decisions - state.decisionsSinceCheck + INTERVALS[state.stage];
     hudProgress.decisions++;
     if (!advance(state, canCheck)) {
       updateHud(ctx);
@@ -210,7 +209,6 @@ export default function (pi: ExtensionAPI) {
     }
     entries.push({ type: "custom", customType: CHECK_TYPE, data: { stage: state.stage, unit: "decision" } });
     collectingRequestedCheckpoint = true;
-    collectionTarget = target;
     injectCheckpointRequest = true;
     updateHud(ctx);
     return { entries, continue: true };

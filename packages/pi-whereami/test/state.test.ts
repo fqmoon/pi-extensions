@@ -24,21 +24,21 @@ test("HUD parses durable checkpoints and ignores malformed history", () => {
     assert.equal(parseCheckpoint(invalid), undefined);
   }
   const malformed = { type: "custom_message", customType: CHECKPOINT_TYPE, content: "bad" };
-  assert.deepEqual(restoreHudCheckpoint([checkpoint, malformed] as any), { fields });
+  assert.deepEqual(restoreHudCheckpoint([checkpoint, malformed] as any), { fields, decision: 0 });
   assert.equal(restoreHudCheckpoint([checkpoint, user] as any), undefined);
   assert.equal(restoreHudCheckpoint([checkpoint, user, malformed] as any), undefined);
-  assert.deepEqual(restoreHudCheckpoint([checkpoint, user, checkpoint] as any), { fields });
+  assert.deepEqual(restoreHudCheckpoint([checkpoint, user, checkpoint] as any), { fields, decision: 0 });
   assert.equal(restoreHudCheckpoint([user] as any), undefined);
 });
 
-test("HUD shows waiting progress without inventing fields and sanitizes only its display", () => {
+test("HUD shows the latest checkpoint decision and sanitizes only its display", () => {
   const state = { stage: 0, decisionsSinceCheck: 3 };
-  assert.deepEqual(formatHud(undefined, state, { decisions: 3, checkpoints: 0 }, false), ["whereami · Decisions: 3/12 · Checkpoints: 0 · Awaiting first checkpoint"]);
-  assert.deepEqual(formatHud(undefined, { stage: 1, decisionsSinceCheck: 0 }, { decisions: 12, checkpoints: 0 }, true), ["whereami · Decisions: 12/12 · Checkpoints: 0 · Updating checkpoint"]);
+  assert.deepEqual(formatHud(undefined, state, { decisions: 3, checkpoints: 0 }), ["whereami · Decisions: 3/12 · Checkpoints: 0 · No checkpoint yet"]);
+  assert.deepEqual(formatHud(undefined, { stage: 1, decisionsSinceCheck: 0 }, { decisions: 12, checkpoints: 0 }), ["whereami · Decisions: 12/20 · Checkpoints: 0 · No checkpoint yet"]);
   const fields = { level: "module", scope: "\x1b[31mrenderer\x1b[0m", state: "dirty tracking", next: "inspect" };
-  const hud = { fields };
-  const lines = formatHud(hud, state, { decisions: 3, checkpoints: 1 }, false);
-  assert.equal(lines[0], "whereami · Decisions: 3/12 · Checkpoints: 1 · Latest checkpoint");
+  const hud = { fields, decision: 2 };
+  const lines = formatHud(hud, state, { decisions: 3, checkpoints: 1 });
+  assert.equal(lines[0], "whereami · Decisions: 3/12 · Checkpoints: 1 · Checkpoint at decision 2");
   assert.equal(lines[1], "Level: module · Scope: renderer");
   assert.equal(fields.scope, "\x1b[31mrenderer\x1b[0m"); // Original durable data is untouched.
 });
@@ -147,9 +147,14 @@ test("HUD replay shares decision exemptions and counts only valid checkpoints af
     assistant("failed", ["read"], "error"), { type: "context_edit", targetId: "task-0", replacement: null }];
   const progress = restoreHudProgress(branch as any);
   assert.deepEqual(progress, { decisions: 13, checkpoints: 1 });
-  assert.match(formatHud(undefined, restoreState(branch as any), progress, false)[0], /Decisions: 13\/20 · Checkpoints: 1/);
+  assert.deepEqual(restoreHudCheckpoint(branch as any), {
+    fields: { level: "module", scope: "renderer", state: "dirty", next: "inspect" },
+    decision: 12,
+  });
+  assert.match(formatHud(restoreHudCheckpoint(branch as any), restoreState(branch as any), progress)[0],
+    /Decisions: 13\/20 · Checkpoints: 1 · Checkpoint at decision 12/);
   assert.deepEqual(restoreHudProgress([...branch, user] as any), freshHudProgress());
   // A due check deferred by the actual trigger gate shifts the next threshold.
   const delayed = [user, ...turns(15), check(1), assistant("later", ["read"])];
-  assert.match(formatHud(undefined, restoreState(delayed as any), restoreHudProgress(delayed as any), false)[0], /Decisions: 16\/23/);
+  assert.match(formatHud(undefined, restoreState(delayed as any), restoreHudProgress(delayed as any))[0], /Decisions: 16\/23/);
 });

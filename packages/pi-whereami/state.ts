@@ -54,9 +54,10 @@ export function advance(state: TriggerState, canCheck = true): boolean {
 }
 
 /** Restore the active path only; abandoned branches never contribute to this counter. */
-function restoreBranch(branch: readonly SessionEntry[]): { state: TriggerState; progress: HudProgress } {
+function restoreBranch(branch: readonly SessionEntry[]): { state: TriggerState; progress: HudProgress; checkpoint?: HudCheckpoint } {
   const state = freshState();
   let progress = freshHudProgress();
+  let checkpoint: HudCheckpoint | undefined;
   // These entries follow the response at its safe boundary. Resolve them first
   // so an interrupted request does not exempt unrelated work after resume.
   const requestedResponses = new Set<string>();
@@ -72,6 +73,7 @@ function restoreBranch(branch: readonly SessionEntry[]): { state: TriggerState; 
       state.stage = 0;
       state.decisionsSinceCheck = 0;
       progress = freshHudProgress();
+      checkpoint = undefined;
       legacyRequest = false;
     } else if (entry.type === "custom" && entry.customType === CHECK_TYPE &&
       typeof (entry.data as { stage?: unknown } | undefined)?.stage === "number" &&
@@ -94,11 +96,15 @@ function restoreBranch(branch: readonly SessionEntry[]): { state: TriggerState; 
         progress.decisions++;
       }
       legacyRequest = false;
-    } else if (entry.type === "custom_message" && entry.customType === CHECKPOINT_TYPE && parseCheckpoint(entry.content)) {
-      progress.checkpoints++;
+    } else if (entry.type === "custom_message" && entry.customType === CHECKPOINT_TYPE) {
+      const fields = parseCheckpoint(entry.content);
+      if (fields) {
+        progress.checkpoints++;
+        checkpoint = { fields, decision: progress.decisions };
+      }
     }
   }
-  return { state, progress };
+  return { state, progress, checkpoint };
 }
 
 export function restoreState(branch: readonly SessionEntry[]): TriggerState {
@@ -118,6 +124,7 @@ export interface CheckpointFields {
 
 export interface HudCheckpoint {
   fields: Required<CheckpointFields>;
+  decision: number;
 }
 
 /** Read only the plugin's fixed durable format; malformed history is skipped. */
@@ -129,28 +136,16 @@ export function parseCheckpoint(content: unknown): Required<CheckpointFields> | 
   return formatCheckpoint(fields) ? fields : undefined;
 }
 
-/** Read the latest valid checkpoint after the current branch's latest user input. */
+/** Read the latest valid checkpoint and the decision count at which it was recorded. */
 export function restoreHudCheckpoint(branch: readonly SessionEntry[]): HudCheckpoint | undefined {
-  let checkpoint: HudCheckpoint | undefined;
-  for (const entry of branch) {
-    if (entry.type === "message" && entry.message.role === "user") {
-      checkpoint = undefined;
-    } else if (entry.type === "custom_message" && entry.customType === CHECKPOINT_TYPE) {
-      const fields = parseCheckpoint(entry.content);
-      if (fields) checkpoint = { fields };
-    }
-  }
-  return checkpoint;
+  return restoreBranch(branch).checkpoint;
 }
 
-/** The panel is a view of the last checkpoint, not another model-context message. */
-export function formatHud(checkpoint: HudCheckpoint | undefined, triggerState: TriggerState, progress: HudProgress, updating: boolean, collectionTarget = progress.decisions): string[] {
-  // Preserve the due threshold during collection, even if its safe boundary
-  // was delayed. The next target uses the actual last check and stage interval.
-  const target = updating ? collectionTarget
-    : progress.decisions - triggerState.decisionsSinceCheck + INTERVALS[triggerState.stage];
-  const title = updating ? "Updating checkpoint" : checkpoint ? "Latest checkpoint" : "Awaiting first checkpoint";
-  const header = `whereami · Decisions: ${progress.decisions}/${target} · Checkpoints: ${progress.checkpoints} · ${title}`;
+/** The panel is a view of recorded state, not collection progress. */
+export function formatHud(checkpoint: HudCheckpoint | undefined, triggerState: TriggerState, progress: HudProgress): string[] {
+  const target = progress.decisions - triggerState.decisionsSinceCheck + INTERVALS[triggerState.stage];
+  const status = checkpoint ? `Checkpoint at decision ${checkpoint.decision}` : "No checkpoint yet";
+  const header = `whereami · Decisions: ${progress.decisions}/${target} · Checkpoints: ${progress.checkpoints} · ${status}`;
   if (!checkpoint) return [header];
   // Keep terminal control sequences out of the widget. The durable checkpoint
   // remains unchanged, and the host handles ordinary wrapping and styling.
