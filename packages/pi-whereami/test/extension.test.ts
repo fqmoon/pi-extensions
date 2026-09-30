@@ -135,7 +135,7 @@ test("checkpoint records outside a re-orientation window without advancing decis
   assert.deepEqual(after.entries.map((entry: any) => entry.type), ["context_edit", "context_edit", "custom_message"]);
   assert.deepEqual(restoreState(h.ctx.sessionManager.getBranch()), { stage: 0, decisionsSinceCheck: 5 });
   assert.deepEqual(restoreHudProgress(h.ctx.sessionManager.getBranch()), { decisions: 5, checkpoints: 1 });
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 5\/12 · Checkpoints: 1 · Checkpoint at decision 5/);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 5\/12 · Checkpoint at decision 5/);
   assert.equal(await h.decisions(6), undefined);
   assert.equal((await h.decisions(1))?.continue, true);
 });
@@ -157,7 +157,7 @@ test("a checkpoint remains valid after the requested collection turn was missed"
   await h.boundary([{ toolName: TOOL_NAME, toolCallId: "late", isError: false, details: recorded.details }]);
   assert.deepEqual(restoreState(h.ctx.sessionManager.getBranch()), { stage: 1, decisionsSinceCheck: 1 });
   assert.deepEqual(restoreHudProgress(h.ctx.sessionManager.getBranch()), { decisions: 13, checkpoints: 1 });
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/20 · Checkpoints: 1 · Checkpoint at decision 13/);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/20 · Checkpoint at decision 13/);
 });
 
 test("HUD stays visible between runs and keeps cumulative progress through successful checkpoints", async () => {
@@ -172,15 +172,15 @@ test("HUD stays visible between runs and keeps cumulative progress through succe
   await h.emit("agent_start");
   await h.emit("message_start", { message: { role: "user" } });
   assert.deepEqual(h.widgets.get("pi-whereami"), {
-    content: ["WhereAmI · Decisions: 0/12 · Checkpoints: 0 · No checkpoint yet"], placement: "aboveEditor",
+    content: ["WhereAmI · Decisions: 0/12 · No checkpoint yet"], placement: "aboveEditor",
   });
   await h.decisions(3);
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 3\/12 · Checkpoints: 0/);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 3\/12/);
   await h.decisions(9);
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 12\/20 · Checkpoints: 0 · No checkpoint yet/);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 12\/20 · No checkpoint yet/);
   await collectCheckpoint(h);
   assert.deepEqual(h.widgets.get("pi-whereami")?.content, [
-    "WhereAmI · Decisions: 12/20 · Checkpoints: 1 · Checkpoint at decision 12", "Level: module · Scope: renderer",
+    "WhereAmI · Decisions: 12/20 · Checkpoint at decision 12", "Level: module · Scope: renderer",
     "State: dirty propagation is likely", "Next: inspect invalidation",
   ]);
   assert.deepEqual(restoreHudProgress(h.ctx.sessionManager.getBranch()), { decisions: 12, checkpoints: 1 });
@@ -188,11 +188,11 @@ test("HUD stays visible between runs and keeps cumulative progress through succe
   assert.equal(checkpoints()[0].content, "[whereami checkpoint]\n\nLevel: module\nScope: renderer\nState: dirty propagation is likely\nNext: inspect invalidation");
   assert.equal(JSON.stringify(h.ctx.sessionManager.buildSessionContext().messages).includes("Decisions:"), false);
   await h.decisions(1);
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/20 · Checkpoints: 1/);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/20/);
   await h.decisions(7);
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 20\/26 · Checkpoints: 1 · Checkpoint at decision 12/);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 20\/26 · Checkpoint at decision 12/);
   await collectCheckpoint(h, "pipeline");
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 20\/26 · Checkpoints: 2/);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 20\/26/);
   assert.match(h.widgets.get("pi-whereami")!.content[1], /Scope: pipeline/);
   assert.equal(checkpoints().length, 2);
   await h.boundary([], "completed", [{ type: "text", text: "Finished." }]);
@@ -214,12 +214,12 @@ test("new user input resets HUD counts and fields; failed collection leaves fiel
   await h.decisions(12);
   await collectCheckpoint(h);
   await h.emit("message_start", { message: { role: "custom" } });
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 12\/20 · Checkpoints: 1/);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 12\/20/);
   await h.emit("agent_end");
   const user = { role: "user", content: [{ type: "text", text: "new task" }], timestamp: Date.now() };
   h.ctx.sessionManager.appendMessage(user);
   await h.emit("message_start", { message: user });
-  const emptyContent = ["WhereAmI · Decisions: 0/12 · Checkpoints: 0 · No checkpoint yet"];
+  const emptyContent = ["WhereAmI · Decisions: 0/12 · No checkpoint yet"];
   assert.deepEqual(h.widgets.get("pi-whereami")?.content, emptyContent);
   await h.emit("agent_start");
   assert.deepEqual(h.widgets.get("pi-whereami")?.content, emptyContent);
@@ -227,11 +227,11 @@ test("new user input resets HUD counts and fields; failed collection leaves fiel
   const malformed = await h.tool.execute("bad-hud", { level: "module" });
   await h.boundary([{ toolName: TOOL_NAME, details: malformed.details }]);
   assert.deepEqual(h.widgets.get("pi-whereami")?.content, [
-    "WhereAmI · Decisions: 12/20 · Checkpoints: 0 · No checkpoint yet",
+    "WhereAmI · Decisions: 12/20 · No checkpoint yet",
   ]);
   await h.decisions(8);
   await collectCheckpoint(h, "new task");
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 20\/26 · Checkpoints: 1 · Checkpoint at decision 20/);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 20\/26 · Checkpoint at decision 20/);
   assert.match(h.widgets.get("pi-whereami")!.content[1], /^Level:.*Scope: new task/);
   const lastWidget = h.widgets.get("pi-whereami");
   await h.emit("agent_end");
@@ -250,11 +250,11 @@ test("HUD restores active-branch counts while staying hidden until execution res
   await resumed.emit("session_start");
   assert.equal(resumed.widgets.size, 0);
   await resumed.emit("agent_start");
-  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/20 · Checkpoints: 1/);
+  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/20/);
   assert.match(resumed.widgets.get("pi-whereami")!.content[1], /Scope: renderer/);
   h.ctx.sessionManager.branch(beforeCheckpoint);
   await resumed.emit("session_tree");
-  assert.deepEqual(resumed.widgets.get("pi-whereami")?.content, ["WhereAmI · Decisions: 12/20 · Checkpoints: 0 · No checkpoint yet"]);
+  assert.deepEqual(resumed.widgets.get("pi-whereami")?.content, ["WhereAmI · Decisions: 12/20 · No checkpoint yet"]);
   await resumed.emit("agent_end");
   await resumed.emit("session_tree");
   assert.equal(resumed.widgets.size, 0);
@@ -262,7 +262,7 @@ test("HUD restores active-branch counts while staying hidden until execution res
   h.ctx.sessionManager.appendMessage(user);
   await resumed.emit("session_start");
   await resumed.emit("agent_start");
-  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Decisions: 0\/12 · Checkpoints: 0/);
+  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Decisions: 0\/12/);
   await resumed.emit("session_shutdown");
   assert.equal(resumed.widgets.size, 0);
 });
@@ -281,7 +281,7 @@ test("resume and tree navigation keep fields aligned with checkpoints since the 
   const malformed = await h.tool.execute("bad-hud", { level: "module" });
   await h.boundary([{ toolName: TOOL_NAME, details: malformed.details }]);
   const withoutCheckpoint = h.ctx.sessionManager.getLeafId();
-  const emptyContent = ["WhereAmI · Decisions: 12/20 · Checkpoints: 0 · No checkpoint yet"];
+  const emptyContent = ["WhereAmI · Decisions: 12/20 · No checkpoint yet"];
   const resumed = harness(h.ctx.sessionManager);
   await resumed.emit("session_start");
   await resumed.emit("agent_start");
@@ -290,20 +290,20 @@ test("resume and tree navigation keep fields aligned with checkpoints since the 
 
   h.ctx.sessionManager.branch(oldTask);
   await resumed.emit("session_tree");
-  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Checkpoints: 1 · Checkpoint at decision 12/);
+  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Checkpoint at decision 12/);
   assert.match(resumed.widgets.get("pi-whereami")!.content[1], /Scope: old task/);
   h.ctx.sessionManager.branch(withoutCheckpoint);
   await resumed.emit("session_tree");
   assert.deepEqual(resumed.widgets.get("pi-whereami")?.content, emptyContent);
   await resumed.decisions(8);
   await collectCheckpoint(resumed, "new task");
-  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Checkpoints: 1 · Checkpoint at decision 20/);
+  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Checkpoint at decision 20/);
   assert.match(resumed.widgets.get("pi-whereami")!.content[1], /Scope: new task/);
   const latestWidget = resumed.widgets.get("pi-whereami");
   await resumed.decisions(6);
   const invalid = await resumed.tool.execute("bad-hud", { level: "module" });
   await resumed.boundary([{ toolName: TOOL_NAME, details: invalid.details }]);
-  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Checkpoints: 1 · Checkpoint at decision 20/);
+  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Checkpoint at decision 20/);
   assert.deepEqual(resumed.widgets.get("pi-whereami")!.content.slice(1), latestWidget!.content.slice(1));
 });
 
@@ -318,15 +318,15 @@ test("errors, aborts, and collection cancellation retain the HUD without a pendi
     await h.emit("agent_end");
     await h.emit("agent_before_settle");
     assert.deepEqual(h.widgets.get("pi-whereami")?.content, [
-      "WhereAmI · Decisions: 11/12 · Checkpoints: 0 · No checkpoint yet",
+      "WhereAmI · Decisions: 11/12 · No checkpoint yet",
     ]);
     await h.emit("agent_start");
     await h.decisions(1);
-    assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 12\/20 · Checkpoints: 0 · No checkpoint yet/);
+    assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 12\/20 · No checkpoint yet/);
     await h.emit("agent_end");
     await h.emit("agent_before_settle");
     assert.deepEqual(h.widgets.get("pi-whereami")?.content, [
-      "WhereAmI · Decisions: 12/20 · Checkpoints: 0 · No checkpoint yet",
+      "WhereAmI · Decisions: 12/20 · No checkpoint yet",
     ]);
   }
 });
@@ -337,12 +337,12 @@ test("deferred checks shift the next target without a transient checkpoint statu
   await h.emit("agent_start");
   h.setToolAvailable(false);
   await h.decisions(12);
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 12\/12 · Checkpoints: 0 · No checkpoint yet/);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 12\/12 · No checkpoint yet/);
   h.setToolAvailable(true);
   await h.decisions(1);
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/21 · Checkpoints: 0 · No checkpoint yet/);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/21 · No checkpoint yet/);
   await collectCheckpoint(h);
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/21 · Checkpoints: 1/);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/21/);
   const resumed = harness(h.ctx.sessionManager);
   await resumed.emit("session_start");
   await resumed.emit("agent_start");

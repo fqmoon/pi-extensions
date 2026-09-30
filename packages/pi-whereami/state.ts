@@ -151,7 +151,7 @@ export function restoreHudCheckpoint(branch: readonly SessionEntry[], intervals:
 export function formatHud(checkpoint: HudCheckpoint | undefined, triggerState: TriggerState, progress: HudProgress, intervals: IntervalSchedule = DEFAULT_INTERVALS): string[] {
   const target = progress.decisions - triggerState.decisionsSinceCheck + intervalAt(intervals, triggerState.stage);
   const status = checkpoint ? `Checkpoint at decision ${checkpoint.decision}` : "No checkpoint yet";
-  const header = `WhereAmI · Decisions: ${progress.decisions}/${target} · Checkpoints: ${progress.checkpoints} · ${status}`;
+  const header = `WhereAmI · Decisions: ${progress.decisions}/${target} · ${status}`;
   if (!checkpoint) return [header];
   // Keep terminal control sequences out of the widget. The durable checkpoint
   // remains unchanged, and the host handles ordinary wrapping and styling.
