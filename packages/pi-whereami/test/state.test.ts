@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  advance, formatSnapshot, freshState, INTERVALS, hasTaskToolCall, isDecision,
+  advance, formatSnapshot, formatHud, parseSnapshot, restoreHudSnapshot, freshState, INTERVALS, hasTaskToolCall, isDecision,
   CHECK_TYPE, CHECK_RESPONSE_TYPE, REQUEST_TYPE, restoreState, SNAPSHOT_TYPE, TOOL_NAME,
 } from "../state.ts";
 
@@ -14,6 +14,32 @@ const assistant = (id: string, tools: string[] = [], stopReason = "stop") => ({
 const user = { type: "message", message: { role: "user" } };
 const check = (stage: number) => ({ type: "custom", customType: CHECK_TYPE, data: { stage, unit: "decision" } });
 const response = (id: string) => ({ type: "custom", customType: CHECK_RESPONSE_TYPE, data: { messageEntryId: id } });
+
+test("HUD parses durable snapshots and ignores malformed history", () => {
+  const fields = { level: "module", scope: "renderer", state: "dirty tracking", next: "inspect" };
+  const snapshot = { type: "custom_message", customType: SNAPSHOT_TYPE, content: formatSnapshot(fields) };
+  assert.deepEqual(parseSnapshot(snapshot.content), fields);
+  for (const invalid of [undefined, [], "[whereami]\n\nLevel: module", formatSnapshot(fields)!.replace("Scope: renderer", "Scope: "),
+    formatSnapshot(fields)!.replace("State: dirty tracking", `State: ${"x".repeat(161)}`)]) {
+    assert.equal(parseSnapshot(invalid), undefined);
+  }
+  assert.deepEqual(restoreHudSnapshot([snapshot, user, { type: "custom_message", customType: SNAPSHOT_TYPE, content: "bad" }] as any),
+    { fields, previousInput: true });
+  assert.deepEqual(restoreHudSnapshot([snapshot, user, snapshot] as any), { fields, previousInput: false });
+  assert.equal(restoreHudSnapshot([user] as any), undefined);
+});
+
+test("HUD shows waiting progress without inventing fields and sanitizes only its display", () => {
+  const state = { stage: 0, decisionsSinceCheck: 3 };
+  assert.deepEqual(formatHud(undefined, state, false), ["whereami · Awaiting first snapshot · Decisions 3/12"]);
+  assert.deepEqual(formatHud(undefined, state, true), ["whereami · Updating snapshot"]);
+  const fields = { level: "module", scope: "\x1b[31mrenderer\x1b[0m", state: "dirty tracking", next: "inspect" };
+  const hud = { fields, previousInput: true };
+  const lines = formatHud(hud, state, false);
+  assert.equal(lines[0], "whereami · Awaiting current snapshot · Decisions 3/12");
+  assert.equal(lines[1], "History · Level: module · Scope: renderer");
+  assert.equal(fields.scope, "\x1b[31mrenderer\x1b[0m"); // Original durable data is untouched.
+});
 
 // Deliberately use the same response IDs across different branches only where
 // their shared prefix is identical; restore receives the active path alone.

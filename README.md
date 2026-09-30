@@ -32,6 +32,6 @@ Location: [`packages/pi-knowledge-profile`](./packages/pi-knowledge-profile)
 
 ### whereami
 
-Automatically records brief position snapshots during long autonomous runs (12, then 8, 6, 4… main-task LLM decision turns after each user message).
+Automatically records brief position snapshots during long autonomous runs (12, then 8, 6, 4… main-task LLM decision turns after each user message). A HUD above the editor keeps the latest snapshot visible without replacing the conversation-history records.
 
 Location: [`packages/pi-whereami`](./packages/pi-whereami). Requires PI 0.87.1 or newer; no settings or commands.

@@ -1,16 +1,20 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
-import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   advance,
   formatSnapshot,
+  formatHud,
   freshState,
   hasTaskToolCall,
   isDecision,
   CHECK_TYPE,
   CHECK_RESPONSE_TYPE,
   restoreState,
+  restoreHudSnapshot,
+  parseSnapshot,
+  type HudSnapshot,
   SNAPSHOT_TYPE,
   TOOL_NAME,
 } from "./state.ts";
@@ -47,6 +51,20 @@ export default function (pi: ExtensionAPI) {
   let state = freshState();
   let awaitingSnapshot = false;
   let injectSnapshotRequest = false;
+  let hudSnapshot: HudSnapshot | undefined;
+
+  const updateHud = (ctx: ExtensionContext, clear = false) => {
+    if (!ctx.hasUI) return;
+    try {
+      const lines = clear ? undefined : formatHud(hudSnapshot, state, awaitingSnapshot);
+      if (lines && hudSnapshot?.previousInput) {
+        for (let i = 1; i < lines.length; i++) lines[i] = ctx.ui.theme.fg("muted", lines[i]);
+      }
+      ctx.ui.setWidget("pi-whereami", lines, { placement: "aboveEditor" });
+    } catch {
+      // UI rendering must never prevent a trigger or snapshot from persisting.
+    }
+  };
 
   const clearRequest = () => {
     awaitingSnapshot = false;
@@ -62,17 +80,25 @@ export default function (pi: ExtensionAPI) {
     clearRequest();
   };
 
-  const onSessionPath = (branch: Parameters<typeof restoreState>[0]) => {
+  const onSessionPath = (ctx: ExtensionContext) => {
+    const branch = ctx.sessionManager.getBranch();
     restore(branch);
+    hudSnapshot = restoreHudSnapshot(branch);
+    updateHud(ctx);
     // PI can restore an older session's tool loadout without this newly installed tool.
     if (!pi.getActiveTools().includes(TOOL_NAME)) pi.setActiveTools([...pi.getActiveTools(), TOOL_NAME]);
   };
-  pi.on("session_start", (_event, ctx) => onSessionPath(ctx.sessionManager.getBranch()));
-  pi.on("session_tree", (_event, ctx) => onSessionPath(ctx.sessionManager.getBranch()));
+  pi.on("session_start", (_event, ctx) => onSessionPath(ctx));
+  pi.on("session_tree", (_event, ctx) => onSessionPath(ctx));
+  pi.on("session_shutdown", (_event, ctx) => updateHud(ctx, true));
 
   // Only a delivered user message starts a new counting interval.
-  pi.on("message_start", (event) => {
-    if (event.message.role === "user") reset();
+  pi.on("message_start", (event, ctx) => {
+    if (event.message.role === "user") {
+      reset();
+      if (hudSnapshot) hudSnapshot.previousInput = true;
+      updateHud(ctx);
+    }
   });
 
   pi.on("context", (event) => {
@@ -134,11 +160,16 @@ export default function (pi: ExtensionAPI) {
           entries.push({ type: "context_edit", targetId: resultId, replacement: null });
         }
         entries.push({ type: "custom_message", customType: SNAPSHOT_TYPE, content: snapshot, display: true });
+        const fields = parseSnapshot(snapshot);
+        if (fields) {
+          hudSnapshot = { fields, previousInput: false };
+        }
       }
       clearRequest();
     }
 
     if (!isDecision(event.message, snapshotRequested)) {
+      updateHud(ctx);
       return entries.length > event.entries.length ? { entries } : undefined;
     }
     // Count text/final responses too, but never revive a finished task merely
@@ -147,16 +178,19 @@ export default function (pi: ExtensionAPI) {
     const canCheck = event.outcome === "completed" && hasTaskToolCall(event.message) &&
       !ctx.hasPendingMessages() && pi.getActiveTools().includes(TOOL_NAME);
     if (!advance(state, canCheck)) {
+      updateHud(ctx);
       return entries.length > event.entries.length ? { entries } : undefined;
     }
     entries.push({ type: "custom", customType: CHECK_TYPE, data: { stage: state.stage, unit: "decision" } });
     awaitingSnapshot = true;
     injectSnapshotRequest = true;
+    updateHud(ctx);
     return { entries, continue: true };
   });
 
-  pi.on("agent_before_settle", () => {
+  pi.on("agent_before_settle", (_event, ctx) => {
     // Missing/malformed tool calls or an aborted continuation must not leave a request armed.
     clearRequest();
+    updateHud(ctx);
   });
 }

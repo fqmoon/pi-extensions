@@ -1,3 +1,4 @@
+import { stripVTControlCharacters } from "node:util";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 
 export const INTERVALS = [12, 8, 6, 4] as const;
@@ -86,6 +87,52 @@ export interface SnapshotFields {
   scope?: string;
   state?: string;
   next?: string;
+}
+
+export interface HudSnapshot {
+  fields: Required<SnapshotFields>;
+  previousInput: boolean;
+}
+
+/** Read only the plugin's fixed durable format; malformed history is skipped. */
+export function parseSnapshot(content: unknown): Required<SnapshotFields> | undefined {
+  if (typeof content !== "string") return undefined;
+  const match = /^\[whereami\]\n\nLevel: ([^\r\n]+)\nScope: ([^\r\n]+)\nState: ([^\r\n]+)\nNext: ([^\r\n]+)$/.exec(content);
+  if (!match) return undefined;
+  const fields = { level: match[1], scope: match[2], state: match[3], next: match[4] };
+  return formatSnapshot(fields) ? fields : undefined;
+}
+
+/** The HUD follows the current branch, never a snapshot from a sibling path. */
+export function restoreHudSnapshot(branch: readonly SessionEntry[]): HudSnapshot | undefined {
+  let snapshot: HudSnapshot | undefined;
+  for (const entry of branch) {
+    if (entry.type === "message" && entry.message.role === "user") {
+      if (snapshot) snapshot.previousInput = true;
+    } else if (entry.type === "custom_message" && entry.customType === SNAPSHOT_TYPE) {
+      const fields = parseSnapshot(entry.content);
+      if (fields) snapshot = { fields, previousInput: false };
+    }
+  }
+  return snapshot;
+}
+
+/** The panel is a view of the last snapshot, not another model-context message. */
+export function formatHud(snapshot: HudSnapshot | undefined, triggerState: TriggerState, updating: boolean): string[] {
+  const title = updating ? "Updating snapshot" : !snapshot || snapshot.previousInput
+    ? `Awaiting ${snapshot ? "current" : "first"} snapshot · Decisions ${triggerState.decisionsSinceCheck}/${INTERVALS[triggerState.stage]}`
+    : "Latest snapshot";
+  if (!snapshot) return [`whereami · ${title}`];
+  // Keep terminal control sequences out of the widget. The durable snapshot
+  // remains unchanged, and the host handles ordinary wrapping and styling.
+  const plain = (text: string) => stripVTControlCharacters(text).replace(/[\x00-\x1f\x7f-\x9f]/g, "");
+  const { level, scope, state, next } = snapshot.fields;
+  return [
+    `whereami · ${title}`,
+    `${snapshot.previousInput ? "History · " : ""}Level: ${plain(level)} · Scope: ${plain(scope)}`,
+    `State: ${plain(state)}`,
+    `Next: ${plain(next)}`,
+  ];
 }
 
 /** Never invent a missing field or persist an unbounded progress report. */
