@@ -4,7 +4,7 @@ import { Type } from "@earendil-works/pi-ai";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   advance,
-  formatSnapshot,
+  formatCheckpoint,
   formatHud,
   freshState,
   freshHudProgress,
@@ -15,10 +15,10 @@ import {
   INTERVALS,
   restoreState,
   restoreHudProgress,
-  restoreHudSnapshot,
-  parseSnapshot,
-  type HudSnapshot,
-  SNAPSHOT_TYPE,
+  restoreHudCheckpoint,
+  parseCheckpoint,
+  type HudCheckpoint,
+  CHECKPOINT_TYPE,
   TOOL_NAME,
 } from "./state.ts";
 
@@ -34,10 +34,10 @@ Review your current position in the task:
 If the current path remains the best path, keep it.
 Do not change direction merely because this check occurred.`;
 
-const SNAPSHOT_PROTOCOL = `After re-orienting, call ${TOOL_NAME} exactly once.
-Record the position you now hold, not your reasoning process.
+const CHECKPOINT_PROTOCOL = `After re-orienting, call ${TOOL_NAME} exactly once.
+Record a brief progress checkpoint: the position you now hold, not your reasoning process.
 Use one short sentence per field: Level (repo/subsystem/module/call-chain/file/symbol), Scope, State, Next.
-Do not report the re-orientation analysis separately. Continue the original task after the snapshot.`;
+Do not report the re-orientation analysis separately. Continue the original task after the checkpoint.`;
 
 function loadReorientationPrompt(): string {
   try {
@@ -50,11 +50,11 @@ function loadReorientationPrompt(): string {
 }
 
 export default function (pi: ExtensionAPI) {
-  const request = `${loadReorientationPrompt().trimEnd()}\n\n${SNAPSHOT_PROTOCOL}`;
+  const request = `${loadReorientationPrompt().trimEnd()}\n\n${CHECKPOINT_PROTOCOL}`;
   let state = freshState();
-  let awaitingSnapshot = false;
-  let injectSnapshotRequest = false;
-  let hudSnapshot: HudSnapshot | undefined;
+  let awaitingCheckpoint = false;
+  let injectCheckpointRequest = false;
+  let hudCheckpoint: HudCheckpoint | undefined;
   let hudProgress = freshHudProgress();
   let hudVisible = false;
   let collectionTarget: number | undefined;
@@ -62,22 +62,22 @@ export default function (pi: ExtensionAPI) {
   const updateHud = (ctx: ExtensionContext, clear = false) => {
     if (!ctx.hasUI) return;
     try {
-      const lines = clear || !hudVisible ? undefined : formatHud(hudSnapshot, state, hudProgress, awaitingSnapshot, collectionTarget);
+      const lines = clear || !hudVisible ? undefined : formatHud(hudCheckpoint, state, hudProgress, awaitingCheckpoint, collectionTarget);
       ctx.ui.setWidget("pi-whereami", lines, { placement: "aboveEditor" });
     } catch {
-      // UI rendering must never prevent a trigger or snapshot from persisting.
+      // UI rendering must never prevent a trigger or checkpoint from persisting.
     }
   };
 
   const clearRequest = () => {
-    awaitingSnapshot = false;
-    injectSnapshotRequest = false;
+    awaitingCheckpoint = false;
+    injectCheckpointRequest = false;
     collectionTarget = undefined;
   };
   const reset = () => {
     state = freshState();
     hudProgress = freshHudProgress();
-    hudSnapshot = undefined;
+    hudCheckpoint = undefined;
     clearRequest();
   };
   const restore = (branch: Parameters<typeof restoreState>[0]) => {
@@ -91,7 +91,7 @@ export default function (pi: ExtensionAPI) {
     hudVisible = !ctx.isIdle();
     const branch = ctx.sessionManager.getBranch();
     restore(branch);
-    hudSnapshot = restoreHudSnapshot(branch);
+    hudCheckpoint = restoreHudCheckpoint(branch);
     updateHud(ctx);
     // PI can restore an older session's tool loadout without this newly installed tool.
     if (!pi.getActiveTools().includes(TOOL_NAME)) pi.setActiveTools([...pi.getActiveTools(), TOOL_NAME]);
@@ -117,8 +117,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("context", (event) => {
-    if (!injectSnapshotRequest) return;
-    injectSnapshotRequest = false;
+    if (!injectCheckpointRequest) return;
+    injectCheckpointRequest = false;
     return {
       messages: [...event.messages, { role: "user", content: request, timestamp: Date.now() }],
     };
@@ -126,8 +126,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerTool({
     name: TOOL_NAME,
-    label: "WhereAmI",
-    description: "Record a brief position snapshot when requested by the whereami extension. Not a task action.",
+    label: "Checkpoint",
+    description: "Record a brief progress checkpoint when requested by the whereami extension. Not a task action.",
     parameters: Type.Object({
       level: Type.String({ description: "Current abstraction level" }),
       scope: Type.String({ description: "Current problem area" }),
@@ -135,10 +135,10 @@ export default function (pi: ExtensionAPI) {
       next: Type.String({ description: "Next key action" }),
     }),
     async execute(_toolCallId, params) {
-      const snapshot = awaitingSnapshot ? formatSnapshot(params) : undefined;
+      const checkpoint = awaitingCheckpoint ? formatCheckpoint(params) : undefined;
       return {
-        content: [{ type: "text", text: snapshot ? "Snapshot recorded; continue the task." : "No valid snapshot recorded; continue the task." }],
-        details: { snapshot },
+        content: [{ type: "text", text: checkpoint ? "Checkpoint recorded; continue the task." : "No valid checkpoint recorded; continue the task." }],
+        details: { checkpoint },
       };
     },
   });
@@ -147,49 +147,49 @@ export default function (pi: ExtensionAPI) {
     // The boundary runs after the entire tool batch has been persisted. Never insert
     // a custom message between a tool call and its result (invalid on replay).
     const entries = [...event.entries];
-    const snapshotRequested = awaitingSnapshot;
-    if (awaitingSnapshot) {
+    const checkpointRequested = awaitingCheckpoint;
+    if (awaitingCheckpoint) {
       entries.push({ type: "custom", customType: CHECK_RESPONSE_TYPE, data: { messageEntryId: event.messageEntryId } });
-      const snapshotIndex = event.toolResults.findIndex(
+      const checkpointIndex = event.toolResults.findIndex(
         (result) => result.toolName === TOOL_NAME && !result.isError &&
-          typeof (result.details as { snapshot?: unknown } | undefined)?.snapshot === "string",
+          typeof (result.details as { checkpoint?: unknown } | undefined)?.checkpoint === "string",
       );
-      if (snapshotIndex >= 0) {
-        const snapshot = (event.toolResults[snapshotIndex].details as { snapshot: string }).snapshot;
-        // Only omit an assistant entry if it carries nothing but this snapshot call.
+      if (checkpointIndex >= 0) {
+        const checkpoint = (event.toolResults[checkpointIndex].details as { checkpoint: string }).checkpoint;
+        // Only omit an assistant entry if it carries nothing but this checkpoint call.
         // ID alignment can be lost if Pi could not persist one of the tool results.
-        const result = event.toolResults[snapshotIndex];
-        const snapshotOnly = event.toolResults.length === 1 && result.toolName === TOOL_NAME &&
+        const result = event.toolResults[checkpointIndex];
+        const checkpointOnly = event.toolResults.length === 1 && result.toolName === TOOL_NAME &&
           event.message.role === "assistant" && event.message.content.length === 1 &&
           event.message.content[0].type === "toolCall" &&
           event.message.content[0].name === TOOL_NAME &&
           event.message.content[0].id === result.toolCallId;
         const resultId = event.toolResultEntryIds.length === event.toolResults.length
-          ? event.toolResultEntryIds[snapshotIndex] : undefined;
+          ? event.toolResultEntryIds[checkpointIndex] : undefined;
         const assistantEntry = ctx.sessionManager.getEntry(event.messageEntryId);
         const resultEntry = resultId ? ctx.sessionManager.getEntry(resultId) : undefined;
-        if (snapshotOnly && resultId && assistantEntry?.type === "message" && assistantEntry.message.role === "assistant" &&
+        if (checkpointOnly && resultId && assistantEntry?.type === "message" && assistantEntry.message.role === "assistant" &&
           resultEntry?.type === "message" && resultEntry.message.role === "toolResult" &&
           resultEntry.message.toolCallId === result.toolCallId) {
           entries.push({ type: "context_edit", targetId: event.messageEntryId, replacement: null });
           entries.push({ type: "context_edit", targetId: resultId, replacement: null });
         }
-        entries.push({ type: "custom_message", customType: SNAPSHOT_TYPE, content: snapshot, display: true });
-        const fields = parseSnapshot(snapshot);
+        entries.push({ type: "custom_message", customType: CHECKPOINT_TYPE, content: checkpoint, display: true });
+        const fields = parseCheckpoint(checkpoint);
         if (fields) {
-          hudSnapshot = { fields };
-          hudProgress.snapshots++;
+          hudCheckpoint = { fields };
+          hudProgress.checkpoints++;
         }
       }
       clearRequest();
     }
 
-    if (!isDecision(event.message, snapshotRequested)) {
+    if (!isDecision(event.message, checkpointRequested)) {
       updateHud(ctx);
       return entries.length > event.entries.length ? { entries } : undefined;
     }
     // Count text/final responses too, but never revive a finished task merely
-    // to collect a snapshot. Pending input and tool availability gate checks,
+    // to collect a checkpoint. Pending input and tool availability gate checks,
     // not decisions; this keeps live state and branch replay in agreement.
     const canCheck = event.outcome === "completed" && hasTaskToolCall(event.message) &&
       !ctx.hasPendingMessages() && pi.getActiveTools().includes(TOOL_NAME);
@@ -200,9 +200,9 @@ export default function (pi: ExtensionAPI) {
       return entries.length > event.entries.length ? { entries } : undefined;
     }
     entries.push({ type: "custom", customType: CHECK_TYPE, data: { stage: state.stage, unit: "decision" } });
-    awaitingSnapshot = true;
+    awaitingCheckpoint = true;
     collectionTarget = target;
-    injectSnapshotRequest = true;
+    injectCheckpointRequest = true;
     updateHud(ctx);
     return { entries, continue: true };
   });

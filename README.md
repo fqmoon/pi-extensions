@@ -32,6 +32,6 @@ Location: [`packages/pi-knowledge-profile`](./packages/pi-knowledge-profile)
 
 ### whereami
 
-Automatically records brief position snapshots during long autonomous runs (12, then 8, 6, 4… main-task LLM decision turns after each user message). A HUD above the editor shows cumulative decision thresholds (0/12, then 13/20…), the successful snapshot count, and the latest position without replacing conversation-history records. It stays visible after each agent run ends.
+Automatically records brief position checkpoints during long autonomous runs (12, then 8, 6, 4… main-task LLM decision turns after each user message) with the `whereami_checkpoint` tool. A HUD above the editor shows cumulative decision thresholds (0/12, then 13/20…), the successful checkpoint count, and the latest position without replacing conversation-history records. It stays visible after each agent run ends.
 
 Location: [`packages/pi-whereami`](./packages/pi-whereami). Requires PI 0.87.1 or newer; no settings or commands.

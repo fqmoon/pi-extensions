@@ -5,8 +5,8 @@ export const INTERVALS = [12, 8, 6, 4] as const;
 export const REQUEST_TYPE = "pi-whereami-request"; // Legacy sessions only.
 export const CHECK_TYPE = "pi-whereami-check";
 export const CHECK_RESPONSE_TYPE = "pi-whereami-response";
-export const SNAPSHOT_TYPE = "pi-whereami";
-export const TOOL_NAME = "whereami_snapshot";
+export const CHECKPOINT_TYPE = "pi-whereami-checkpoint";
+export const TOOL_NAME = "whereami_checkpoint";
 
 type SessionMessage = Extract<SessionEntry, { type: "message" }>["message"];
 
@@ -17,11 +17,11 @@ export function hasTaskToolCall(message: SessionMessage): boolean {
 }
 
 /** One completed main-task response is one decision, regardless of batch size. */
-export function isDecision(message: SessionMessage, snapshotRequested = false): boolean {
+export function isDecision(message: SessionMessage, checkpointRequested = false): boolean {
   if (message.role !== "assistant" || message.stopReason === "error" || message.stopReason === "aborted") return false;
   // A requested response with no task tools is collection only, even when the
-  // snapshot is missing/malformed or the model includes text/thinking.
-  return !snapshotRequested || hasTaskToolCall(message);
+  // checkpoint is missing/malformed or the model includes text/thinking.
+  return !checkpointRequested || hasTaskToolCall(message);
 }
 
 export interface TriggerState {
@@ -35,11 +35,11 @@ export function freshState(): TriggerState {
 
 export interface HudProgress {
   decisions: number;
-  snapshots: number;
+  checkpoints: number;
 }
 
 export function freshHudProgress(): HudProgress {
-  return { decisions: 0, snapshots: 0 };
+  return { decisions: 0, checkpoints: 0 };
 }
 
 export function advance(state: TriggerState, canCheck = true): boolean {
@@ -74,14 +74,14 @@ function restoreBranch(branch: readonly SessionEntry[]): { state: TriggerState; 
       typeof (entry.data as { stage?: unknown } | undefined)?.stage === "number" &&
       Number.isInteger((entry.data as { stage: number }).stage) &&
       (entry.data as { stage: number }).stage >= 0 && (entry.data as { stage: number }).stage < INTERVALS.length) {
-      // A check consumes the interval even when no valid snapshot follows.
+      // A check consumes the interval even when no valid checkpoint follows.
       state.stage = (entry.data as { stage: number }).stage;
       state.decisionsSinceCheck = 0;
       // Old checks lack response IDs. Keep their consumed stage and infer only
       // their immediate response; new checks use explicit response markers.
       legacyRequest = (entry.data as { unit?: unknown }).unit !== "decision";
     } else if (entry.type === "custom_message" && entry.customType === REQUEST_TYPE) {
-      // Older sessions persisted requests instead of non-context checkpoints.
+      // Older sessions persisted requests instead of non-context trigger checks.
       state.stage = Math.min(state.stage + 1, INTERVALS.length - 1);
       state.decisionsSinceCheck = 0;
       legacyRequest = true;
@@ -91,8 +91,8 @@ function restoreBranch(branch: readonly SessionEntry[]): { state: TriggerState; 
         progress.decisions++;
       }
       legacyRequest = false;
-    } else if (entry.type === "custom_message" && entry.customType === SNAPSHOT_TYPE && parseSnapshot(entry.content)) {
-      progress.snapshots++;
+    } else if (entry.type === "custom_message" && entry.customType === CHECKPOINT_TYPE && parseCheckpoint(entry.content)) {
+      progress.checkpoints++;
     }
   }
   return { state, progress };
@@ -106,53 +106,53 @@ export function restoreHudProgress(branch: readonly SessionEntry[]): HudProgress
   return restoreBranch(branch).progress;
 }
 
-export interface SnapshotFields {
+export interface CheckpointFields {
   level?: string;
   scope?: string;
   state?: string;
   next?: string;
 }
 
-export interface HudSnapshot {
-  fields: Required<SnapshotFields>;
+export interface HudCheckpoint {
+  fields: Required<CheckpointFields>;
 }
 
 /** Read only the plugin's fixed durable format; malformed history is skipped. */
-export function parseSnapshot(content: unknown): Required<SnapshotFields> | undefined {
+export function parseCheckpoint(content: unknown): Required<CheckpointFields> | undefined {
   if (typeof content !== "string") return undefined;
-  const match = /^\[whereami\]\n\nLevel: ([^\r\n]+)\nScope: ([^\r\n]+)\nState: ([^\r\n]+)\nNext: ([^\r\n]+)$/.exec(content);
+  const match = /^\[whereami checkpoint\]\n\nLevel: ([^\r\n]+)\nScope: ([^\r\n]+)\nState: ([^\r\n]+)\nNext: ([^\r\n]+)$/.exec(content);
   if (!match) return undefined;
   const fields = { level: match[1], scope: match[2], state: match[3], next: match[4] };
-  return formatSnapshot(fields) ? fields : undefined;
+  return formatCheckpoint(fields) ? fields : undefined;
 }
 
-/** Read the latest valid snapshot after the current branch's latest user input. */
-export function restoreHudSnapshot(branch: readonly SessionEntry[]): HudSnapshot | undefined {
-  let snapshot: HudSnapshot | undefined;
+/** Read the latest valid checkpoint after the current branch's latest user input. */
+export function restoreHudCheckpoint(branch: readonly SessionEntry[]): HudCheckpoint | undefined {
+  let checkpoint: HudCheckpoint | undefined;
   for (const entry of branch) {
     if (entry.type === "message" && entry.message.role === "user") {
-      snapshot = undefined;
-    } else if (entry.type === "custom_message" && entry.customType === SNAPSHOT_TYPE) {
-      const fields = parseSnapshot(entry.content);
-      if (fields) snapshot = { fields };
+      checkpoint = undefined;
+    } else if (entry.type === "custom_message" && entry.customType === CHECKPOINT_TYPE) {
+      const fields = parseCheckpoint(entry.content);
+      if (fields) checkpoint = { fields };
     }
   }
-  return snapshot;
+  return checkpoint;
 }
 
-/** The panel is a view of the last snapshot, not another model-context message. */
-export function formatHud(snapshot: HudSnapshot | undefined, triggerState: TriggerState, progress: HudProgress, updating: boolean, collectionTarget = progress.decisions): string[] {
+/** The panel is a view of the last checkpoint, not another model-context message. */
+export function formatHud(checkpoint: HudCheckpoint | undefined, triggerState: TriggerState, progress: HudProgress, updating: boolean, collectionTarget = progress.decisions): string[] {
   // Preserve the due threshold during collection, even if its safe boundary
   // was delayed. The next target uses the actual last check and stage interval.
   const target = updating ? collectionTarget
     : progress.decisions - triggerState.decisionsSinceCheck + INTERVALS[triggerState.stage];
-  const title = updating ? "Updating snapshot" : snapshot ? "Latest snapshot" : "Awaiting first snapshot";
-  const header = `whereami · Decisions: ${progress.decisions}/${target} · Snapshots: ${progress.snapshots} · ${title}`;
-  if (!snapshot) return [header];
-  // Keep terminal control sequences out of the widget. The durable snapshot
+  const title = updating ? "Updating checkpoint" : checkpoint ? "Latest checkpoint" : "Awaiting first checkpoint";
+  const header = `whereami · Decisions: ${progress.decisions}/${target} · Checkpoints: ${progress.checkpoints} · ${title}`;
+  if (!checkpoint) return [header];
+  // Keep terminal control sequences out of the widget. The durable checkpoint
   // remains unchanged, and the host handles ordinary wrapping and styling.
   const plain = (text: string) => stripVTControlCharacters(text).replace(/[\x00-\x1f\x7f-\x9f]/g, "");
-  const { level, scope, state, next } = snapshot.fields;
+  const { level, scope, state, next } = checkpoint.fields;
   return [
     header,
     `Level: ${plain(level)} · Scope: ${plain(scope)}`,
@@ -162,11 +162,11 @@ export function formatHud(snapshot: HudSnapshot | undefined, triggerState: Trigg
 }
 
 /** Never invent a missing field or persist an unbounded progress report. */
-export function formatSnapshot(fields: SnapshotFields): string | undefined {
+export function formatCheckpoint(fields: CheckpointFields): string | undefined {
   const values = [fields.level, fields.scope, fields.state, fields.next];
   if (values.some((value) => typeof value !== "string" || !value.trim() || value.length > 160 || /[\r\n]/.test(value))) {
     return undefined;
   }
   const [level, scope, state, next] = values.map((value) => value!.trim());
-  return `[whereami]\n\nLevel: ${level}\nScope: ${scope}\nState: ${state}\nNext: ${next}`;
+  return `[whereami checkpoint]\n\nLevel: ${level}\nScope: ${scope}\nState: ${state}\nNext: ${next}`;
 }

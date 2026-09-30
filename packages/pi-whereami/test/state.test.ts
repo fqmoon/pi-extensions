@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  advance, formatSnapshot, formatHud, parseSnapshot, restoreHudSnapshot, freshHudProgress, restoreHudProgress, freshState, INTERVALS, hasTaskToolCall, isDecision,
-  CHECK_TYPE, CHECK_RESPONSE_TYPE, REQUEST_TYPE, restoreState, SNAPSHOT_TYPE, TOOL_NAME,
+  advance, formatCheckpoint, formatHud, parseCheckpoint, restoreHudCheckpoint, freshHudProgress, restoreHudProgress, freshState, INTERVALS, hasTaskToolCall, isDecision,
+  CHECK_TYPE, CHECK_RESPONSE_TYPE, REQUEST_TYPE, restoreState, CHECKPOINT_TYPE, TOOL_NAME,
 } from "../state.ts";
 
 const assistant = (id: string, tools: string[] = [], stopReason = "stop") => ({
@@ -15,30 +15,30 @@ const user = { type: "message", message: { role: "user" } };
 const check = (stage: number) => ({ type: "custom", customType: CHECK_TYPE, data: { stage, unit: "decision" } });
 const response = (id: string) => ({ type: "custom", customType: CHECK_RESPONSE_TYPE, data: { messageEntryId: id } });
 
-test("HUD parses durable snapshots and ignores malformed history", () => {
+test("HUD parses durable checkpoints and ignores malformed history", () => {
   const fields = { level: "module", scope: "renderer", state: "dirty tracking", next: "inspect" };
-  const snapshot = { type: "custom_message", customType: SNAPSHOT_TYPE, content: formatSnapshot(fields) };
-  assert.deepEqual(parseSnapshot(snapshot.content), fields);
-  for (const invalid of [undefined, [], "[whereami]\n\nLevel: module", formatSnapshot(fields)!.replace("Scope: renderer", "Scope: "),
-    formatSnapshot(fields)!.replace("State: dirty tracking", `State: ${"x".repeat(161)}`)]) {
-    assert.equal(parseSnapshot(invalid), undefined);
+  const checkpoint = { type: "custom_message", customType: CHECKPOINT_TYPE, content: formatCheckpoint(fields) };
+  assert.deepEqual(parseCheckpoint(checkpoint.content), fields);
+  for (const invalid of [undefined, [], "[whereami checkpoint]\n\nLevel: module", formatCheckpoint(fields)!.replace("Scope: renderer", "Scope: "),
+    formatCheckpoint(fields)!.replace("State: dirty tracking", `State: ${"x".repeat(161)}`)]) {
+    assert.equal(parseCheckpoint(invalid), undefined);
   }
-  const malformed = { type: "custom_message", customType: SNAPSHOT_TYPE, content: "bad" };
-  assert.deepEqual(restoreHudSnapshot([snapshot, malformed] as any), { fields });
-  assert.equal(restoreHudSnapshot([snapshot, user] as any), undefined);
-  assert.equal(restoreHudSnapshot([snapshot, user, malformed] as any), undefined);
-  assert.deepEqual(restoreHudSnapshot([snapshot, user, snapshot] as any), { fields });
-  assert.equal(restoreHudSnapshot([user] as any), undefined);
+  const malformed = { type: "custom_message", customType: CHECKPOINT_TYPE, content: "bad" };
+  assert.deepEqual(restoreHudCheckpoint([checkpoint, malformed] as any), { fields });
+  assert.equal(restoreHudCheckpoint([checkpoint, user] as any), undefined);
+  assert.equal(restoreHudCheckpoint([checkpoint, user, malformed] as any), undefined);
+  assert.deepEqual(restoreHudCheckpoint([checkpoint, user, checkpoint] as any), { fields });
+  assert.equal(restoreHudCheckpoint([user] as any), undefined);
 });
 
 test("HUD shows waiting progress without inventing fields and sanitizes only its display", () => {
   const state = { stage: 0, decisionsSinceCheck: 3 };
-  assert.deepEqual(formatHud(undefined, state, { decisions: 3, snapshots: 0 }, false), ["whereami · Decisions: 3/12 · Snapshots: 0 · Awaiting first snapshot"]);
-  assert.deepEqual(formatHud(undefined, { stage: 1, decisionsSinceCheck: 0 }, { decisions: 12, snapshots: 0 }, true), ["whereami · Decisions: 12/12 · Snapshots: 0 · Updating snapshot"]);
+  assert.deepEqual(formatHud(undefined, state, { decisions: 3, checkpoints: 0 }, false), ["whereami · Decisions: 3/12 · Checkpoints: 0 · Awaiting first checkpoint"]);
+  assert.deepEqual(formatHud(undefined, { stage: 1, decisionsSinceCheck: 0 }, { decisions: 12, checkpoints: 0 }, true), ["whereami · Decisions: 12/12 · Checkpoints: 0 · Updating checkpoint"]);
   const fields = { level: "module", scope: "\x1b[31mrenderer\x1b[0m", state: "dirty tracking", next: "inspect" };
   const hud = { fields };
-  const lines = formatHud(hud, state, { decisions: 3, snapshots: 1 }, false);
-  assert.equal(lines[0], "whereami · Decisions: 3/12 · Snapshots: 1 · Latest snapshot");
+  const lines = formatHud(hud, state, { decisions: 3, checkpoints: 1 }, false);
+  assert.equal(lines[0], "whereami · Decisions: 3/12 · Checkpoints: 1 · Latest checkpoint");
   assert.equal(lines[1], "Level: module · Scope: renderer");
   assert.equal(fields.scope, "\x1b[31mrenderer\x1b[0m"); // Original durable data is untouched.
 });
@@ -86,7 +86,7 @@ test("decision classification counts responses rather than tools or results", ()
 test("branch replay counts assistant responses and resets at actual user messages", () => {
   const turns = (n: number, prefix: string) => Array.from({ length: n }, (_, i) => assistant(`${prefix}-${i}`, ["read", "grep"]));
   const branch = [user, ...turns(12, "a"), check(1), assistant("s1", [TOOL_NAME]), response("s1"),
-    { type: "custom_message", customType: SNAPSHOT_TYPE }, ...turns(8, "b"), check(2),
+    { type: "custom_message", customType: CHECKPOINT_TYPE }, ...turns(8, "b"), check(2),
     assistant("s2"), response("s2"), ...turns(6, "c"), check(3), assistant("s3", [TOOL_NAME]), response("s3"),
     ...turns(4, "d"), check(3), assistant("s4", [TOOL_NAME]), response("s4"), ...turns(2, "e")];
   assert.deepEqual(restoreState(branch as any), { stage: 3, decisionsSinceCheck: 2 });
@@ -128,25 +128,25 @@ test("legacy checks keep consumed stages and rebuild subsequent decision counts"
     { stage: 0, decisionsSinceCheck: 1 });
 });
 
-test("invalid snapshot fields are skipped, not filled in by the extension", () => {
-  assert.equal(formatSnapshot({ level: "module", scope: "renderer", state: "likely dirty tracking", next: "inspect boundary" }),
-    "[whereami]\n\nLevel: module\nScope: renderer\nState: likely dirty tracking\nNext: inspect boundary");
-  assert.equal(formatSnapshot({ level: "file", scope: "renderer", state: "", next: "read" }), undefined);
-  assert.equal(formatSnapshot({ level: "file", scope: "renderer\nother", state: "x", next: "read" }), undefined);
-  assert.equal(formatSnapshot({ level: "file", scope: "renderer", state: "x", next: "x".repeat(161) }), undefined);
+test("invalid checkpoint fields are skipped, not filled in by the extension", () => {
+  assert.equal(formatCheckpoint({ level: "module", scope: "renderer", state: "likely dirty tracking", next: "inspect boundary" }),
+    "[whereami checkpoint]\n\nLevel: module\nScope: renderer\nState: likely dirty tracking\nNext: inspect boundary");
+  assert.equal(formatCheckpoint({ level: "file", scope: "renderer", state: "", next: "read" }), undefined);
+  assert.equal(formatCheckpoint({ level: "file", scope: "renderer\nother", state: "x", next: "read" }), undefined);
+  assert.equal(formatCheckpoint({ level: "file", scope: "renderer", state: "x", next: "x".repeat(161) }), undefined);
 });
 
-test("HUD replay shares decision exemptions and counts only valid snapshots after the latest user input", () => {
-  const valid = { type: "custom_message", customType: SNAPSHOT_TYPE,
-    content: formatSnapshot({ level: "module", scope: "renderer", state: "dirty", next: "inspect" }) };
+test("HUD replay shares decision exemptions and counts only valid checkpoints after the latest user input", () => {
+  const valid = { type: "custom_message", customType: CHECKPOINT_TYPE,
+    content: formatCheckpoint({ level: "module", scope: "renderer", state: "dirty", next: "inspect" }) };
   const turns = (n: number) => Array.from({ length: n }, (_, i) => assistant(`task-${i}`, ["read"]));
   const branch = [user, ...turns(12), check(1), assistant("sample", [TOOL_NAME]), response("sample"), valid,
     assistant("mixed", [TOOL_NAME, "read"]), response("mixed"),
-    { type: "custom_message", customType: SNAPSHOT_TYPE, content: "bad" },
+    { type: "custom_message", customType: CHECKPOINT_TYPE, content: "bad" },
     assistant("failed", ["read"], "error"), { type: "context_edit", targetId: "task-0", replacement: null }];
   const progress = restoreHudProgress(branch as any);
-  assert.deepEqual(progress, { decisions: 13, snapshots: 1 });
-  assert.match(formatHud(undefined, restoreState(branch as any), progress, false)[0], /Decisions: 13\/20 · Snapshots: 1/);
+  assert.deepEqual(progress, { decisions: 13, checkpoints: 1 });
+  assert.match(formatHud(undefined, restoreState(branch as any), progress, false)[0], /Decisions: 13\/20 · Checkpoints: 1/);
   assert.deepEqual(restoreHudProgress([...branch, user] as any), freshHudProgress());
   // A due check deferred by the actual trigger gate shifts the next threshold.
   const delayed = [user, ...turns(15), check(1), assistant("later", ["read"])];

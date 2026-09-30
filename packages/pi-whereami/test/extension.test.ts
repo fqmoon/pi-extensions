@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { registerHooks } from "node:module";
 import { after, test } from "node:test";
-import { CHECK_TYPE, CHECK_RESPONSE_TYPE, REQUEST_TYPE, restoreState, restoreHudProgress, SNAPSHOT_TYPE, TOOL_NAME } from "../state.ts";
+import { CHECK_TYPE, CHECK_RESPONSE_TYPE, REQUEST_TYPE, restoreState, restoreHudProgress, CHECKPOINT_TYPE, TOOL_NAME } from "../state.ts";
 
 // The monorepo has an older local PI installation. Resolve pi-ai from the
 // host PI dependency tree for this test; extension imports remain normal.
@@ -108,43 +108,50 @@ function harness(sessionManager = SessionManager.inMemory("/tmp"), agentDir = de
   return { ctx, emit, boundary, actions, decisions, widgets, setWidgetError(error: boolean) { widgetError = error; }, setToolAvailable(available: boolean) { toolAvailable = available; }, setPendingMessages(pending: boolean) { pendingMessages = pending; }, get tool() { return tool; } };
 }
 
-async function collectSnapshot(h: ReturnType<typeof harness>, scope = "renderer") {
+async function collectCheckpoint(h: ReturnType<typeof harness>, scope = "renderer") {
   await h.emit("context", { messages: [] });
   const recorded = await h.tool.execute("hud-sample", { level: "module", scope, state: "dirty propagation is likely", next: "inspect invalidation" });
+  assert.deepEqual(Object.keys(recorded.details), ["checkpoint"]);
+  assert.match(recorded.details.checkpoint, /^\[whereami checkpoint\]/);
+  assert.equal(recorded.content[0].text, "Checkpoint recorded; continue the task.");
   return h.boundary([{ toolName: TOOL_NAME, toolCallId: "hud-sample", isError: false, details: recorded.details }]);
 }
 
-test("HUD stays visible between runs and keeps cumulative progress through successful snapshots", async () => {
+test("HUD stays visible between runs and keeps cumulative progress through successful checkpoints", async () => {
   const h = harness();
+  assert.equal(CHECKPOINT_TYPE, "pi-whereami-checkpoint");
+  assert.equal(h.tool.name, "whereami_checkpoint");
+  assert.equal(h.tool.label, "Checkpoint");
+  assert.match(h.tool.description, /checkpoint/i);
   await h.emit("session_start");
   assert.equal(h.widgets.size, 0);
   assert.equal(h.ctx.sessionManager.getBranch().length, 0);
   await h.emit("agent_start");
   await h.emit("message_start", { message: { role: "user" } });
   assert.deepEqual(h.widgets.get("pi-whereami"), {
-    content: ["whereami · Decisions: 0/12 · Snapshots: 0 · Awaiting first snapshot"], placement: "aboveEditor",
+    content: ["whereami · Decisions: 0/12 · Checkpoints: 0 · Awaiting first checkpoint"], placement: "aboveEditor",
   });
   await h.decisions(3);
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 3\/12 · Snapshots: 0/);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 3\/12 · Checkpoints: 0/);
   await h.decisions(9);
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 12\/12 · Snapshots: 0 · Updating snapshot/);
-  await collectSnapshot(h);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 12\/12 · Checkpoints: 0 · Updating checkpoint/);
+  await collectCheckpoint(h);
   assert.deepEqual(h.widgets.get("pi-whereami")?.content, [
-    "whereami · Decisions: 12/20 · Snapshots: 1 · Latest snapshot", "Level: module · Scope: renderer",
+    "whereami · Decisions: 12/20 · Checkpoints: 1 · Latest checkpoint", "Level: module · Scope: renderer",
     "State: dirty propagation is likely", "Next: inspect invalidation",
   ]);
-  assert.deepEqual(restoreHudProgress(h.ctx.sessionManager.getBranch()), { decisions: 12, snapshots: 1 });
-  const snapshots = () => h.ctx.sessionManager.getBranch().filter((entry: any) => entry.customType === SNAPSHOT_TYPE);
-  assert.equal(snapshots()[0].content, "[whereami]\n\nLevel: module\nScope: renderer\nState: dirty propagation is likely\nNext: inspect invalidation");
+  assert.deepEqual(restoreHudProgress(h.ctx.sessionManager.getBranch()), { decisions: 12, checkpoints: 1 });
+  const checkpoints = () => h.ctx.sessionManager.getBranch().filter((entry: any) => entry.customType === CHECKPOINT_TYPE);
+  assert.equal(checkpoints()[0].content, "[whereami checkpoint]\n\nLevel: module\nScope: renderer\nState: dirty propagation is likely\nNext: inspect invalidation");
   assert.equal(JSON.stringify(h.ctx.sessionManager.buildSessionContext().messages).includes("Decisions:"), false);
   await h.decisions(1);
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/20 · Snapshots: 1/);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/20 · Checkpoints: 1/);
   await h.decisions(7);
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 20\/20 · Snapshots: 1 · Updating snapshot/);
-  await collectSnapshot(h, "pipeline");
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 20\/26 · Snapshots: 2/);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 20\/20 · Checkpoints: 1 · Updating checkpoint/);
+  await collectCheckpoint(h, "pipeline");
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 20\/26 · Checkpoints: 2/);
   assert.match(h.widgets.get("pi-whereami")!.content[1], /Scope: pipeline/);
-  assert.equal(snapshots().length, 2);
+  assert.equal(checkpoints().length, 2);
   await h.boundary([], "completed", [{ type: "text", text: "Finished." }]);
   const lastWidget = h.widgets.get("pi-whereami");
   await h.emit("agent_end");
@@ -162,14 +169,14 @@ test("new user input resets HUD counts and fields; failed collection leaves fiel
   await h.emit("session_start");
   await h.emit("agent_start");
   await h.decisions(12);
-  await collectSnapshot(h);
+  await collectCheckpoint(h);
   await h.emit("message_start", { message: { role: "custom" } });
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 12\/20 · Snapshots: 1/);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 12\/20 · Checkpoints: 1/);
   await h.emit("agent_end");
   const user = { role: "user", content: [{ type: "text", text: "new task" }], timestamp: Date.now() };
   h.ctx.sessionManager.appendMessage(user);
   await h.emit("message_start", { message: user });
-  const emptyContent = ["whereami · Decisions: 0/12 · Snapshots: 0 · Awaiting first snapshot"];
+  const emptyContent = ["whereami · Decisions: 0/12 · Checkpoints: 0 · Awaiting first checkpoint"];
   assert.deepEqual(h.widgets.get("pi-whereami")?.content, emptyContent);
   await h.emit("agent_start");
   assert.deepEqual(h.widgets.get("pi-whereami")?.content, emptyContent);
@@ -177,11 +184,11 @@ test("new user input resets HUD counts and fields; failed collection leaves fiel
   const malformed = await h.tool.execute("bad-hud", { level: "module" });
   await h.boundary([{ toolName: TOOL_NAME, details: malformed.details }]);
   assert.deepEqual(h.widgets.get("pi-whereami")?.content, [
-    "whereami · Decisions: 12/20 · Snapshots: 0 · Awaiting first snapshot",
+    "whereami · Decisions: 12/20 · Checkpoints: 0 · Awaiting first checkpoint",
   ]);
   await h.decisions(8);
-  await collectSnapshot(h, "new task");
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 20\/26 · Snapshots: 1 · Latest snapshot/);
+  await collectCheckpoint(h, "new task");
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 20\/26 · Checkpoints: 1 · Latest checkpoint/);
   assert.match(h.widgets.get("pi-whereami")!.content[1], /^Level:.*Scope: new task/);
   const lastWidget = h.widgets.get("pi-whereami");
   await h.emit("agent_end");
@@ -193,18 +200,18 @@ test("HUD restores active-branch counts while staying hidden until execution res
   await h.emit("session_start");
   await h.emit("agent_start");
   await h.decisions(12);
-  const beforeSnapshot = h.ctx.sessionManager.getLeafId();
-  await collectSnapshot(h);
+  const beforeCheckpoint = h.ctx.sessionManager.getLeafId();
+  await collectCheckpoint(h);
   await h.decisions(1);
   const resumed = harness(h.ctx.sessionManager);
   await resumed.emit("session_start");
   assert.equal(resumed.widgets.size, 0);
   await resumed.emit("agent_start");
-  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/20 · Snapshots: 1/);
+  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/20 · Checkpoints: 1/);
   assert.match(resumed.widgets.get("pi-whereami")!.content[1], /Scope: renderer/);
-  h.ctx.sessionManager.branch(beforeSnapshot);
+  h.ctx.sessionManager.branch(beforeCheckpoint);
   await resumed.emit("session_tree");
-  assert.deepEqual(resumed.widgets.get("pi-whereami")?.content, ["whereami · Decisions: 12/20 · Snapshots: 0 · Awaiting first snapshot"]);
+  assert.deepEqual(resumed.widgets.get("pi-whereami")?.content, ["whereami · Decisions: 12/20 · Checkpoints: 0 · Awaiting first checkpoint"]);
   await resumed.emit("agent_end");
   await resumed.emit("session_tree");
   assert.equal(resumed.widgets.size, 0);
@@ -212,17 +219,17 @@ test("HUD restores active-branch counts while staying hidden until execution res
   h.ctx.sessionManager.appendMessage(user);
   await resumed.emit("session_start");
   await resumed.emit("agent_start");
-  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Decisions: 0\/12 · Snapshots: 0/);
+  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Decisions: 0\/12 · Checkpoints: 0/);
   await resumed.emit("session_shutdown");
   assert.equal(resumed.widgets.size, 0);
 });
 
-test("resume and tree navigation keep fields aligned with snapshots since the latest user input", async () => {
+test("resume and tree navigation keep fields aligned with checkpoints since the latest user input", async () => {
   const h = harness();
   await h.emit("session_start");
   await h.emit("agent_start");
   await h.decisions(12);
-  await collectSnapshot(h, "old task");
+  await collectCheckpoint(h, "old task");
   const oldTask = h.ctx.sessionManager.getLeafId();
   const user = { role: "user", content: [{ type: "text", text: "new task" }], timestamp: Date.now() };
   h.ctx.sessionManager.appendMessage(user);
@@ -230,30 +237,30 @@ test("resume and tree navigation keep fields aligned with snapshots since the la
   await h.decisions(12);
   const malformed = await h.tool.execute("bad-hud", { level: "module" });
   await h.boundary([{ toolName: TOOL_NAME, details: malformed.details }]);
-  const withoutSnapshot = h.ctx.sessionManager.getLeafId();
-  const emptyContent = ["whereami · Decisions: 12/20 · Snapshots: 0 · Awaiting first snapshot"];
+  const withoutCheckpoint = h.ctx.sessionManager.getLeafId();
+  const emptyContent = ["whereami · Decisions: 12/20 · Checkpoints: 0 · Awaiting first checkpoint"];
   const resumed = harness(h.ctx.sessionManager);
   await resumed.emit("session_start");
   await resumed.emit("agent_start");
   assert.deepEqual(resumed.widgets.get("pi-whereami")?.content, emptyContent);
-  assert.equal(h.ctx.sessionManager.getBranch().filter((entry: any) => entry.customType === SNAPSHOT_TYPE).length, 1);
+  assert.equal(h.ctx.sessionManager.getBranch().filter((entry: any) => entry.customType === CHECKPOINT_TYPE).length, 1);
 
   h.ctx.sessionManager.branch(oldTask);
   await resumed.emit("session_tree");
-  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Snapshots: 1 · Latest snapshot/);
+  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Checkpoints: 1 · Latest checkpoint/);
   assert.match(resumed.widgets.get("pi-whereami")!.content[1], /Scope: old task/);
-  h.ctx.sessionManager.branch(withoutSnapshot);
+  h.ctx.sessionManager.branch(withoutCheckpoint);
   await resumed.emit("session_tree");
   assert.deepEqual(resumed.widgets.get("pi-whereami")?.content, emptyContent);
   await resumed.decisions(8);
-  await collectSnapshot(resumed, "new task");
-  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Snapshots: 1 · Latest snapshot/);
+  await collectCheckpoint(resumed, "new task");
+  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Checkpoints: 1 · Latest checkpoint/);
   assert.match(resumed.widgets.get("pi-whereami")!.content[1], /Scope: new task/);
   const latestWidget = resumed.widgets.get("pi-whereami");
   await resumed.decisions(6);
   const invalid = await resumed.tool.execute("bad-hud", { level: "module" });
   await resumed.boundary([{ toolName: TOOL_NAME, details: invalid.details }]);
-  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Snapshots: 1 · Latest snapshot/);
+  assert.match(resumed.widgets.get("pi-whereami")!.content[0], /Checkpoints: 1 · Latest checkpoint/);
   assert.deepEqual(resumed.widgets.get("pi-whereami")!.content.slice(1), latestWidget!.content.slice(1));
 });
 
@@ -268,15 +275,15 @@ test("errors, aborts, and collection cancellation retain the HUD without a pendi
     await h.emit("agent_end");
     await h.emit("agent_before_settle");
     assert.deepEqual(h.widgets.get("pi-whereami")?.content, [
-      "whereami · Decisions: 11/12 · Snapshots: 0 · Awaiting first snapshot",
+      "whereami · Decisions: 11/12 · Checkpoints: 0 · Awaiting first checkpoint",
     ]);
     await h.emit("agent_start");
     await h.decisions(1);
-    assert.match(h.widgets.get("pi-whereami")!.content[0], /Updating snapshot/);
+    assert.match(h.widgets.get("pi-whereami")!.content[0], /Updating checkpoint/);
     await h.emit("agent_end");
     await h.emit("agent_before_settle");
     assert.deepEqual(h.widgets.get("pi-whereami")?.content, [
-      "whereami · Decisions: 12/20 · Snapshots: 0 · Awaiting first snapshot",
+      "whereami · Decisions: 12/20 · Checkpoints: 0 · Awaiting first checkpoint",
     ]);
   }
 });
@@ -287,28 +294,28 @@ test("deferred checks show the real due threshold and shift the subsequent targe
   await h.emit("agent_start");
   h.setToolAvailable(false);
   await h.decisions(12);
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 12\/12 · Snapshots: 0 · Awaiting first snapshot/);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 12\/12 · Checkpoints: 0 · Awaiting first checkpoint/);
   h.setToolAvailable(true);
   await h.decisions(1);
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/12 · Snapshots: 0 · Updating snapshot/);
-  await collectSnapshot(h);
-  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/21 · Snapshots: 1/);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/12 · Checkpoints: 0 · Updating checkpoint/);
+  await collectCheckpoint(h);
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/21 · Checkpoints: 1/);
   const resumed = harness(h.ctx.sessionManager);
   await resumed.emit("session_start");
   await resumed.emit("agent_start");
   assert.deepEqual(resumed.widgets.get("pi-whereami"), h.widgets.get("pi-whereami"));
 });
 
-test("headless mode and widget failures preserve the trigger and snapshot behavior", async () => {
+test("headless mode and widget failures preserve trigger checks and checkpoint behavior", async () => {
   for (const hasUI of [false, true]) {
     const h = harness(undefined, undefined, hasUI);
     h.setWidgetError(true);
     await h.emit("session_start");
     await h.emit("agent_start");
     assert.equal((await h.decisions(12))?.continue, true);
-    const result = await collectSnapshot(h);
-    assert.equal(result.entries.at(-1).customType, SNAPSHOT_TYPE);
-    assert.equal(h.ctx.sessionManager.getBranch().filter((entry: any) => entry.customType === SNAPSHOT_TYPE).length, 1);
+    const result = await collectCheckpoint(h);
+    assert.equal(result.entries.at(-1).customType, CHECKPOINT_TYPE);
+    assert.equal(h.ctx.sessionManager.getBranch().filter((entry: any) => entry.customType === CHECKPOINT_TYPE).length, 1);
     assert.equal(h.widgets.size, 0);
     await h.emit("agent_end");
     await h.emit("session_shutdown");
@@ -330,7 +337,7 @@ test("missing reorient.md uses the built-in strategy and fixed protocol", async 
   assert.match(prompt, /continuing mainly from momentum, local adjacency, or an outdated assumption\?/);
   assert.match(prompt, /would resolve the important uncertainty more directly, prefer it\./);
   assert.match(prompt, /If the current path remains the best path, keep it\./);
-  assert.match(prompt, /call whereami_snapshot exactly once/);
+  assert.match(prompt, /call whereami_checkpoint exactly once/);
   assert.match(prompt, /Level .* Scope, State, Next/);
 });
 
@@ -345,13 +352,13 @@ test("user strategy replaces the default, retains the protocol, and is loaded on
     const prompt = await injectedPrompt(h);
     assert.match(prompt, /CUSTOM REORIENT/);
     assert.doesNotMatch(prompt, /Re-orient before continuing/);
-    assert.match(prompt, /call whereami_snapshot exactly once/);
+    assert.match(prompt, /call whereami_checkpoint exactly once/);
     assert.match(prompt, /Level .* Scope, State, Next/);
     assert.equal(JSON.stringify(h.ctx.sessionManager.getBranch()).includes("CUSTOM REORIENT"), false);
     assert.equal((await h.emit("context", { messages: [] }))?.messages, undefined);
     const replaced = await injectedPrompt(harness(undefined, dir));
     assert.match(replaced, /Do whatever you want/);
-    assert.match(replaced, /call whereami_snapshot exactly once/);
+    assert.match(replaced, /call whereami_checkpoint exactly once/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -372,8 +379,11 @@ test("blank or unreadable reorient.md falls back without failing the agent", asy
   }
 });
 
-test("decision turns request one check; main model tool writes exactly one custom snapshot and keeps working", async () => {
+test("decision turns request one check; main model tool writes exactly one custom checkpoint and keeps working", async () => {
   const h = harness();
+  assert.equal(h.tool.name, "whereami_checkpoint");
+  assert.equal(h.tool.label, "Checkpoint");
+  assert.match(h.tool.description, /checkpoint/i);
   await h.emit("session_start");
   await h.emit("message_start", { message: { role: "user" } });
   assert.equal(await h.decisions(11), undefined);
@@ -385,16 +395,16 @@ test("decision turns request one check; main model tool writes exactly one custo
   const context = [{ role: "user", content: "real task", timestamp: 1 }];
   const requested = await h.emit("context", { messages: context });
   assert.match(requested.messages.at(-1).content, /Re-orient before continuing/);
-  assert.match(requested.messages.at(-1).content, /whereami_snapshot/);
+  assert.match(requested.messages.at(-1).content, /whereami_checkpoint/);
   assert.deepEqual((await h.emit("context", { messages: context }))?.messages, undefined);
   const response = await h.tool.execute("check-1", { level: "module", scope: "renderer", state: "dirty propagation is likely", next: "inspect invalidation" });
   const after = await h.boundary([{ role: "toolResult", toolCallId: "check-1", toolName: TOOL_NAME, isError: false, details: response.details }]);
   assert.deepEqual(after.entries.map((entry: any) => entry.type), ["custom", "context_edit", "context_edit", "custom_message"]);
-  assert.equal(after.entries[3].customType, SNAPSHOT_TYPE);
+  assert.equal(after.entries[3].customType, CHECKPOINT_TYPE);
   assert.equal(after.entries[3].display, true);
   assert.equal(after.continue, undefined); // Normal tool-follow-up, not a forced steering turn.
   const branch = h.ctx.sessionManager.getBranch();
-  assert.equal(branch.filter((entry: any) => entry.customType === SNAPSHOT_TYPE).length, 1);
+  assert.equal(branch.filter((entry: any) => entry.customType === CHECKPOINT_TYPE).length, 1);
   assert.equal(branch.filter((entry: any) => entry.type === "context_edit").length, 2);
   assert.equal(branch.some((entry: any) => entry.type === "message" && entry.message.role === "assistant" &&
     entry.message.content.some((part: any) => part.name === TOOL_NAME)), true);
@@ -402,7 +412,7 @@ test("decision turns request one check; main model tool writes exactly one custo
     entry.message.toolName === TOOL_NAME), true);
   const projected = h.ctx.sessionManager.buildSessionContext().messages;
   assert.equal(projected.at(-1)?.role, "custom");
-  assert.match(JSON.stringify(projected.at(-1)), /\[whereami\]/);
+  assert.match(JSON.stringify(projected.at(-1)), /\[whereami checkpoint\]/);
   assert.equal(projected.some((message: any) => message.role === "toolResult" && message.toolName === TOOL_NAME), false);
   assert.equal(projected.some((message: any) => message.role === "assistant" && message.content?.some((part: any) => part.name === TOOL_NAME)), false);
   assert.equal(JSON.stringify(branch).includes("Re-orient before continuing"), false);
@@ -412,7 +422,7 @@ test("decision turns request one check; main model tool writes exactly one custo
   assert.equal((await h.decisions(1))?.continue, true); // next interval is 8
 });
 
-test("mixed snapshot and task tool calls retain the whole task turn in context", async () => {
+test("mixed checkpoint and task tool calls retain the whole task turn in context", async () => {
   const h = harness();
   await h.emit("session_start");
   assert.equal((await h.decisions(12))?.continue, true);
@@ -455,9 +465,9 @@ test("required fields and invalid or interrupted checks never force a retry", as
   await h.emit("session_start");
   assert.equal((await h.decisions(12))?.continue, true);
   const malformed = await h.tool.execute("bad", { level: "module", scope: "renderer", state: "x\ny", next: "inspect" });
-  assert.equal(malformed.details.snapshot, undefined);
+  assert.equal(malformed.details.checkpoint, undefined);
   assert.equal((await h.boundary([{ toolName: TOOL_NAME, toolCallId: "bad", details: malformed.details }])).entries[0].customType, CHECK_RESPONSE_TYPE);
-  assert.equal(h.ctx.sessionManager.getBranch().some((entry: any) => entry.customType === SNAPSHOT_TYPE), false);
+  assert.equal(h.ctx.sessionManager.getBranch().some((entry: any) => entry.customType === CHECKPOINT_TYPE), false);
   assert.equal((await h.emit("context", { messages: [] }))?.messages, undefined);
   assert.equal((await h.decisions(8))?.continue, true);
   await h.emit("agent_before_settle");
@@ -471,7 +481,7 @@ test("bad fields and failed checks do not interrupt the task; user resets at dee
   for (const n of [12, 8, 6, 4]) {
     assert.equal((await h.decisions(n))?.continue, true);
     const malformed = await h.tool.execute("bad", { scope: "renderer" });
-    assert.equal(malformed.details.snapshot, undefined);
+    assert.equal(malformed.details.checkpoint, undefined);
     assert.equal((await h.boundary([{ role: "toolResult", toolName: TOOL_NAME, isError: false, details: malformed.details }])).entries[0].customType, CHECK_RESPONSE_TYPE);
   }
   // A failed sampling turn (no tool called) is allowed to finish normally.
@@ -527,12 +537,12 @@ test("status-only responses and ordinary text count; final answers do not force 
   assert.equal((await h.boundary([{ toolName: "status" }]))?.continue, true);
 });
 
-test("requested text without a snapshot is exempt on resume without leaking a prompt", async () => {
+test("trigger checks exempt requested text on resume without leaking a prompt", async () => {
   const h = harness();
   await h.emit("session_start");
   await h.decisions(12);
   await h.emit("context", { messages: [] });
-  const after = await h.boundary([], "completed", [{ type: "text", text: "No snapshot provided." }]);
+  const after = await h.boundary([], "completed", [{ type: "text", text: "No checkpoint provided." }]);
   assert.deepEqual(after.entries.map((entry: any) => entry.customType), [CHECK_RESPONSE_TYPE]);
   assert.equal(after.continue, undefined);
   const branch = h.ctx.sessionManager.getBranch();
@@ -544,8 +554,8 @@ test("requested text without a snapshot is exempt on resume without leaking a pr
   assert.equal((await resumed.decisions(1))?.continue, true);
 });
 
-test("requested mixed work counts once even when the snapshot is missing or invalid", async () => {
-  for (const sample of [[], [{ toolName: TOOL_NAME, details: { snapshot: undefined } }]]) {
+test("requested mixed work counts once even when the checkpoint is missing or invalid", async () => {
+  for (const sample of [[], [{ toolName: TOOL_NAME, details: { checkpoint: undefined } }]]) {
     const h = harness();
     await h.emit("session_start");
     await h.decisions(12);
@@ -600,7 +610,7 @@ test("an older session's tool loadout activates the plugin; later unavailability
   assert.equal((await h.decisions(1))?.continue, true);
 });
 
-test("resuming a session keeps checkpoint and context edits on their own branch", async () => {
+test("resuming a session keeps trigger checks and context edits on their own branch", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-whereami-cleanup-"));
   try {
     const manager = SessionManager.create(dir, dir);
@@ -627,7 +637,7 @@ test("resuming a session keeps checkpoint and context edits on their own branch"
     resumed.branch(anchor);
     const sibling = harness(resumed);
     await sibling.emit("session_tree");
-    assert.equal(resumed.getBranch().some((entry: any) => entry.customType === SNAPSHOT_TYPE), false);
+    assert.equal(resumed.getBranch().some((entry: any) => entry.customType === CHECKPOINT_TYPE), false);
     assert.equal(resumed.getBranch().some((entry: any) => entry.type === "context_edit"), false);
     assert.equal((await sibling.decisions(8))?.continue, true);
   } finally {
@@ -635,22 +645,22 @@ test("resuming a session keeps checkpoint and context edits on their own branch"
   }
 });
 
-test("session file resume and branch keep the snapshot in history without polluting sibling branches", () => {
+test("session file resume and branch keep the checkpoint in history without polluting sibling branches", () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-whereami-"));
   try {
     const manager = SessionManager.create(dir, dir);
     // PI flushes a session file only once it contains a real assistant response.
     manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "Work in progress" }], timestamp: Date.now(), stopReason: "stop", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 } } as any);
     const anchor = manager.appendCustomMessageEntry("anchor", "other context", true);
-    const snapshot = manager.appendCustomMessageEntry(SNAPSHOT_TYPE, "[whereami]\n\nLevel: module\nScope: renderer\nState: likely invalidation\nNext: inspect boundary", true);
+    const checkpoint = manager.appendCustomMessageEntry(CHECKPOINT_TYPE, "[whereami checkpoint]\n\nLevel: module\nScope: renderer\nState: likely invalidation\nNext: inspect boundary", true);
     const path = manager.getSessionFile()!;
     const resumed = SessionManager.open(path);
-    assert.equal(resumed.getBranch().some((entry: any) => entry.id === snapshot), true);
+    assert.equal(resumed.getBranch().some((entry: any) => entry.id === checkpoint), true);
     assert.equal(resumed.buildSessionContext().messages.at(-1)?.role, "custom");
     resumed.branch(anchor);
-    assert.equal(resumed.getBranch().some((entry: any) => entry.id === snapshot), false);
-    resumed.appendCustomMessageEntry(SNAPSHOT_TYPE, "[whereami]\n\nLevel: file\nScope: second branch\nState: unknown\nNext: inspect", true);
-    assert.equal(resumed.getBranch().some((entry: any) => entry.id === snapshot), false);
+    assert.equal(resumed.getBranch().some((entry: any) => entry.id === checkpoint), false);
+    resumed.appendCustomMessageEntry(CHECKPOINT_TYPE, "[whereami checkpoint]\n\nLevel: file\nScope: second branch\nState: unknown\nNext: inspect", true);
+    assert.equal(resumed.getBranch().some((entry: any) => entry.id === checkpoint), false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
