@@ -1,38 +1,108 @@
 # pi-whereami
 
-A Pi extension that periodically asks the **current agent** to re-orient and record a brief position checkpoint during long autonomous runs. A compact HUD above the editor displays the current run state while the same checkpoints continue to appear in conversation history. No second model, automatic drift detection, forced direction change, or settings UI.
+English | [简体中文](README.zh-CN.md)
 
-Requires `@earendil-works/pi-coding-agent` 0.87.1 or newer. Install the package with Pi or load `index.ts` directly. This monorepo loads it via the root `pi.extensions` manifest.
+## The agent is still working. But where is it now?
 
-After each actual user message, the first check is after 12 main-task **LLM decision turns**; later checks are after 8, 6, 4, 4… decisions. A new user message resets this schedule. One completed main-task assistant response counts once, whether it calls one tool, twenty parallel tools, a status tool, or no tools. For example, parallel reads of A/B/C in one response count as one decision; reading A, B, and C in three successive responses counts as three. Failed tool results still count when the assistant response itself completed normally; provider error/aborted responses and internal HTTP retries do not count.
+During a long task, an agent can read file after file, follow a call chain, and keep making tool calls. It becomes hard to tell what it has learned—or whether the next step still serves the original task.
 
-The check occurs at the safe turn boundary after the entire tool batch. Text/final responses count but never force a continuation just to collect a checkpoint; a due interval is consumed only at a subsequent safe task-tool boundary, with no pending input and the checkpoint tool available. A plugin-requested collection response without other task tool calls does not count, even if it includes text/thinking or omits/malforms the checkpoint. A requested response that also calls ordinary task tools counts once, whether or not it fills the checkpoint.
+`pi-whereami` periodically asks the **agent already doing the work** to pause and re-orient:
 
-At each check, the extension temporarily asks the main agent to reassess its current abstraction level, scope, and whether its path is still informative rather than merely adjacent. It may keep a productive deep dive; the plugin does not judge the direction. The main agent then fills four required short fields through its own `whereami_checkpoint` tool. The request is visible only to that model call, not saved in the session. Once filled, the extension stores a visible `pi-whereami-checkpoint` custom message in the current session:
+- Where am I working, and at what level?
+- What do I currently understand?
+- Is this path still useful, or am I following it out of momentum?
+- What is the next useful action?
+
+It records a short checkpoint, then lets the agent continue. You can see the latest position above the editor and look back at earlier checkpoints in the conversation.
+
+**No second agent. No need to keep asking “where are we?”**
+
+## Install
+
+Requires **Pi 0.87.1 or newer**.
+
+```bash
+pi install npm:pi-whereami
+```
+
+Start Pi, or run `/reload` in an existing session. Then give the agent a task as usual. There is no command to run or setup required.
+
+To try it directly from this repository, run this from the repository root:
+
+```bash
+pi -e ./packages/pi-whereami/index.ts
+```
+
+## What you see
+
+A compact panel appears above the editor when the agent starts working. For example:
 
 ```text
-[whereami checkpoint]
-
-Level: module
-Scope: rendering pipeline
+whereami · Decisions: 13/20 · Checkpoints: 1 · Latest checkpoint
+Level: module · Scope: rendering pipeline
 State: invalidation remains the likely issue
 Next: inspect the dirty propagation boundary
 ```
 
-A checkpoint records a point in task progress, not necessarily a completed milestone. The tool is `whereami_checkpoint`, its result exposes `details.checkpoint`, and durable records use the `pi-whereami-checkpoint` custom message type with a `[whereami checkpoint]` marker. The extension identity remains `pi-whereami`.
+The four fields describe the agent's position:
 
-In interactive mode, the HUD appears when the agent starts executing and stays visible after the run ends, including errors or aborts. Later runs update the same panel. All panel labels are English. Its header always includes `Decisions: A/B` and `Checkpoints: N`, alongside the latest checkpoint's Level / Scope / State / Next. Both counts reset to zero on each delivered real user message. A counts the same main-task decisions as the existing trigger; checkpoint-only collection responses do not increment it. B is the cumulative next trigger threshold: `0/12`, `12/12` during collection, `12/20` after collection, then `13/20`; later thresholds are 26, 30, 34… under the existing 12 → 8 → 6 → 4… intervals. If a due check is deferred by the existing trigger gates, the next threshold follows the actual consumed boundary. N counts valid recorded checkpoints, so failed checks advance the trigger stage without incrementing N.
+| Field | Meaning |
+| --- | --- |
+| Level | The level of detail it is working at, such as subsystem, module, or function. |
+| Scope | The part of the problem it is currently focused on. |
+| State | Its current understanding—not a transcript of its reasoning. |
+| Next | The next key action it plans to take. |
 
-Before any checkpoint exists for the current user message, the header says `Awaiting first checkpoint` and no position fields are shown. A new user message clears the fields together with both counts; the HUD only shows the latest valid checkpoint counted by `Checkpoints: N`. Earlier checkpoints remain in conversation history. During collection it says `Updating checkpoint`. Progress remains visible in all these states, including after a successful checkpoint. The panel never invents an initial position or requests an extra model response.
+`Decisions: 13/20` means 13 main-task responses have completed since your last message; the next check is due at 20. It is **not** a task-completion percentage. `Checkpoints: 1` means one checkpoint has been successfully recorded during that period.
 
-The HUD restores its counts and fields from the active session branch on resume or tree navigation, initially staying hidden if idle until execution starts, and clears on session shutdown/reload. Malformed checkpoints leave the last valid position for the current user message intact, or leave the fields empty if none exists. Headless modes skip the widget, and a UI failure cannot interfere with trigger bookkeeping or message persistence. Position fields are periodic checkpoints rather than a real-time tool/activity tracker; existing trigger intervals and history/context behavior are unchanged.
+Before the first checkpoint, the panel says `Awaiting first checkpoint`. While collecting one, it says `Updating checkpoint`. The position fields update only when a valid checkpoint arrives: **this is a periodic snapshot, not a live tool-activity feed**.
 
-To replace the built-in re-orientation strategy, create `<agent-dir>/whereami/reorient.md` (by default `~/.pi/agent/whereami/reorient.md`; `PI_CODING_AGENT_DIR` overrides `<agent-dir>`). A missing, blank, or unreadable file falls back to the built-in strategy. The file is read once when the extension loads; changing it requires reloading the extension. Its content **replaces** the default strategy, but the plugin always appends its own checkpoint instructions, including the fixed Level / Scope / State / Next fields and a request not to report the analysis separately. There is no project-specific prompt hierarchy or live file watching.
+The panel stays visible after the agent finishes or is interrupted. Your next message resets it, but earlier checkpoints remain in conversation history. Resuming a session or switching branches restores the corresponding position when execution starts.
 
-Pi stores the checkpoint as a `custom_message`, so it survives session resume and follows the current branch. For model requests Pi represents custom messages as user-role content; they are **not** real user input and do not reset the schedule. A non-context `pi-whereami-check` entry records the consumed trigger stage for resume and branching, even if the check fails. New checks identify the decision unit, and a non-context `pi-whereami-response` entry identifies the assistant response actually answering that request. This keeps interrupted collection from excluding unrelated work after resume. Replay counts assistant responses in the raw active branch, not tool results or the projected model context. Existing trigger checks retain their consumed stage, with subsequent history recounted in decisions; historical trigger positions are not rewritten.
+Panel labels are currently English. Non-interactive modes still record checkpoints, but do not show the panel.
 
-On a successful checkpoint-only turn, append-only context edits omit its assistant tool call and tool result from future model context while retaining both in the raw session. When other task work shares the turn, no cleanup is attempted. The tool result is only an acknowledgement; the checkpoint is not also emitted as an assistant progress report. If fields are missing, too long, or malformed, the check is skipped and the agent keeps working. Automatic context compaction may summarize earlier history rather than keeping old checkpoints verbatim in later model requests.
+## When it checks
 
-Evaluate search quality separately on real long tasks: check whether an uninformative file chain changes level or evidence source, a productive deep dive stays on course, stagnant work considers a competing explanation, and a clearly wrong direction changes `Next` substantively. Offline tests verify the mechanism, not these model behaviors.
+After each new user message, the first check is due after **12 main-task model responses**. The next intervals are **8, 6, then 4 responses**, repeating every 4 thereafter.
 
-From the monorepo root, run the offline tests with `node --test packages/pi-whereami/test/*.test.ts` (Node 24+). The monorepo's existing lockfile has an older PI SDK; the extension itself targets the host PI version indicated above.
+A response counts once, whether it calls one tool or several tools in parallel. These are model turns, not individual tool calls or elapsed time. A response used only to collect a checkpoint does not count toward the next interval.
+
+Checks wait until the current batch of task tools finishes, and give pending user input priority. The extension does not restart a finished task just to collect a checkpoint, so short tasks may finish without one.
+
+## What it does—and does not—promise
+
+The default reminder asks the agent to reconsider its working level, main uncertainty, and choice of evidence. If another path would be more informative, it encourages a change. If the current deep dive is productive, it encourages staying with it.
+
+**The extension prompts a reassessment; it does not decide whether the agent is right.**
+
+- It does not independently detect drift, verify progress, or force a direction change.
+- A checkpoint is the agent's own account of its position, not proof that a milestone is complete.
+- It uses your current agent and model. There is no separate reviewer model or API key, but checks can add model turns, tokens, and latency.
+- Checkpoints are saved in the session and included in later model context. Pi's automatic compaction may summarize older ones.
+- If the agent fails to provide a valid checkpoint, no new position is recorded and work continues. The panel keeps the last valid position, if any.
+
+It is useful when you want occasional orientation during long investigations or implementation tasks—not another agent supervising every step.
+
+## Optional: change the reminder
+
+The built-in reminder works without configuration. To replace it, create:
+
+```text
+~/.pi/agent/whereami/reorient.md
+```
+
+For example:
+
+```markdown
+Before continuing, check whether the recent work has narrowed the main uncertainty.
+If not, consider a competing explanation or a different source of evidence.
+Keep a productive investigation on course; do not change direction just to change it.
+```
+
+This file **replaces** the built-in re-orientation reminder. You do not need to specify the checkpoint format: the extension still asks for the four fields and tells the agent to continue the original task.
+
+Run `/reload` after editing it. A missing, empty, or unreadable file uses the default reminder. If you set `PI_CODING_AGENT_DIR`, the file belongs under that directory's `whereami/reorient.md` instead. There are no project-specific reminder files or interval settings.
+
+## License
+
+MIT.

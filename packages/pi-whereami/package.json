@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Short, periodic agent position checkpoints in Pi session history.",
   "type": "module",
-  "files": ["index.ts", "state.ts", "README.md", "LICENSE"],
+  "files": ["index.ts", "state.ts", "README.md", "README.zh-CN.md", "LICENSE"],
   "keywords": ["pi", "pi-agent", "pi-extension", "pi-package"],
   "author": "fqmoon",
   "license": "MIT",
