@@ -10,7 +10,6 @@
   "pi": {
     "extensions": [
       "./packages/pi-chat-tail/index.ts",
-      "./packages/pi-knowledge-profile/index.ts",
       "./packages/pi-whereami/index.ts"
     ]
   }

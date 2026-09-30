@@ -1,5 +1,9 @@
 # pi-knowledge-profile
 
+> [!WARNING]
+> **Archived.** This experiment is no longer active or maintained.
+> Inferring a stable user knowledge profile from task-oriented conversations proved too noisy and context-dependent: session-local details were over-recorded and mastery was overestimated.
+
 An evidence-backed Pi extension that automatically maintains a bidirectional user knowledge profile across sessions.
 
 It is not a general memory system. It records both what the user demonstrably understands and which knowledge still needs explanation, so the Agent can calibrate explanation depth. Knowledge content is stored and reconciled as Markdown; JSON is reserved for program state.
