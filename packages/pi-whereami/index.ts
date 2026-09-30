@@ -52,7 +52,7 @@ function loadReorientationPrompt(): string {
 export default function (pi: ExtensionAPI) {
   const request = `${loadReorientationPrompt().trimEnd()}\n\n${CHECKPOINT_PROTOCOL}`;
   let state = freshState();
-  let awaitingCheckpoint = false;
+  let collectingRequestedCheckpoint = false;
   let injectCheckpointRequest = false;
   let hudCheckpoint: HudCheckpoint | undefined;
   let hudProgress = freshHudProgress();
@@ -62,15 +62,15 @@ export default function (pi: ExtensionAPI) {
   const updateHud = (ctx: ExtensionContext, clear = false) => {
     if (!ctx.hasUI) return;
     try {
-      const lines = clear || !hudVisible ? undefined : formatHud(hudCheckpoint, state, hudProgress, awaitingCheckpoint, collectionTarget);
+      const lines = clear || !hudVisible ? undefined : formatHud(hudCheckpoint, state, hudProgress, collectingRequestedCheckpoint, collectionTarget);
       ctx.ui.setWidget("pi-whereami", lines, { placement: "aboveEditor" });
     } catch {
       // UI rendering must never prevent a trigger or checkpoint from persisting.
     }
   };
 
-  const clearRequest = () => {
-    awaitingCheckpoint = false;
+  const clearCollection = () => {
+    collectingRequestedCheckpoint = false;
     injectCheckpointRequest = false;
     collectionTarget = undefined;
   };
@@ -78,13 +78,13 @@ export default function (pi: ExtensionAPI) {
     state = freshState();
     hudProgress = freshHudProgress();
     hudCheckpoint = undefined;
-    clearRequest();
+    clearCollection();
   };
   const restore = (branch: Parameters<typeof restoreState>[0]) => {
     state = restoreState(branch);
     hudProgress = restoreHudProgress(branch);
     // An interrupted request must not become a new autonomous run on resume.
-    clearRequest();
+    clearCollection();
   };
 
   const onSessionPath = (ctx: ExtensionContext) => {
@@ -127,7 +127,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: TOOL_NAME,
     label: "Checkpoint",
-    description: "Record a brief progress checkpoint when requested by the whereami extension. Not a task action.",
+    description: "Record a brief progress checkpoint at any time. Not a task action.",
     parameters: Type.Object({
       level: Type.String({ description: "Current abstraction level" }),
       scope: Type.String({ description: "Current problem area" }),
@@ -135,9 +135,9 @@ export default function (pi: ExtensionAPI) {
       next: Type.String({ description: "Next key action" }),
     }),
     async execute(_toolCallId, params) {
-      const checkpoint = awaitingCheckpoint ? formatCheckpoint(params) : undefined;
+      const checkpoint = formatCheckpoint(params);
       return {
-        content: [{ type: "text", text: checkpoint ? "Checkpoint recorded; continue the task." : "No valid checkpoint recorded; continue the task." }],
+        content: [{ type: "text", text: checkpoint ? "Checkpoint recorded; continue the task." : "Invalid checkpoint; continue the task." }],
         details: { checkpoint },
       };
     },
@@ -147,33 +147,39 @@ export default function (pi: ExtensionAPI) {
     // The boundary runs after the entire tool batch has been persisted. Never insert
     // a custom message between a tool call and its result (invalid on replay).
     const entries = [...event.entries];
-    const checkpointRequested = awaitingCheckpoint;
-    if (awaitingCheckpoint) {
+    const checkpointRequested = collectingRequestedCheckpoint;
+    if (checkpointRequested) {
       entries.push({ type: "custom", customType: CHECK_RESPONSE_TYPE, data: { messageEntryId: event.messageEntryId } });
-      const checkpointIndex = event.toolResults.findIndex(
-        (result) => result.toolName === TOOL_NAME && !result.isError &&
-          typeof (result.details as { checkpoint?: unknown } | undefined)?.checkpoint === "string",
-      );
-      if (checkpointIndex >= 0) {
+    }
+
+    const checkpointIndexes: number[] = [];
+    for (let i = 0; i < event.toolResults.length; i++) {
+      const result = event.toolResults[i];
+      const checkpoint = (result.details as { checkpoint?: unknown } | undefined)?.checkpoint;
+      if (result.toolName === TOOL_NAME && !result.isError && typeof checkpoint === "string") checkpointIndexes.push(i);
+    }
+
+    // A checkpoint is a recorder, not an authorization handshake: any valid call
+    // is persisted and reflected in the HUD, whether or not re-orientation requested it.
+    if (checkpointIndexes.length > 0) {
+      const checkpointOnly = checkpointIndexes.length === 1 && event.toolResults.length === 1 &&
+        event.message.role === "assistant" && event.message.content.length === 1 &&
+        event.message.content[0].type === "toolCall" && event.message.content[0].name === TOOL_NAME &&
+        event.message.content[0].id === event.toolResults[checkpointIndexes[0]].toolCallId;
+      const onlyIndex = checkpointIndexes[0];
+      const resultId = checkpointOnly && event.toolResultEntryIds.length === event.toolResults.length
+        ? event.toolResultEntryIds[onlyIndex] : undefined;
+      const assistantEntry = checkpointOnly ? ctx.sessionManager.getEntry(event.messageEntryId) : undefined;
+      const resultEntry = resultId ? ctx.sessionManager.getEntry(resultId) : undefined;
+      if (checkpointOnly && resultId && assistantEntry?.type === "message" && assistantEntry.message.role === "assistant" &&
+        resultEntry?.type === "message" && resultEntry.message.role === "toolResult" &&
+        resultEntry.message.toolCallId === event.toolResults[onlyIndex].toolCallId) {
+        entries.push({ type: "context_edit", targetId: event.messageEntryId, replacement: null });
+        entries.push({ type: "context_edit", targetId: resultId, replacement: null });
+      }
+
+      for (const checkpointIndex of checkpointIndexes) {
         const checkpoint = (event.toolResults[checkpointIndex].details as { checkpoint: string }).checkpoint;
-        // Only omit an assistant entry if it carries nothing but this checkpoint call.
-        // ID alignment can be lost if Pi could not persist one of the tool results.
-        const result = event.toolResults[checkpointIndex];
-        const checkpointOnly = event.toolResults.length === 1 && result.toolName === TOOL_NAME &&
-          event.message.role === "assistant" && event.message.content.length === 1 &&
-          event.message.content[0].type === "toolCall" &&
-          event.message.content[0].name === TOOL_NAME &&
-          event.message.content[0].id === result.toolCallId;
-        const resultId = event.toolResultEntryIds.length === event.toolResults.length
-          ? event.toolResultEntryIds[checkpointIndex] : undefined;
-        const assistantEntry = ctx.sessionManager.getEntry(event.messageEntryId);
-        const resultEntry = resultId ? ctx.sessionManager.getEntry(resultId) : undefined;
-        if (checkpointOnly && resultId && assistantEntry?.type === "message" && assistantEntry.message.role === "assistant" &&
-          resultEntry?.type === "message" && resultEntry.message.role === "toolResult" &&
-          resultEntry.message.toolCallId === result.toolCallId) {
-          entries.push({ type: "context_edit", targetId: event.messageEntryId, replacement: null });
-          entries.push({ type: "context_edit", targetId: resultId, replacement: null });
-        }
         entries.push({ type: "custom_message", customType: CHECKPOINT_TYPE, content: checkpoint, display: true });
         const fields = parseCheckpoint(checkpoint);
         if (fields) {
@@ -181,8 +187,11 @@ export default function (pi: ExtensionAPI) {
           hudProgress.checkpoints++;
         }
       }
-      clearRequest();
     }
+
+    // The request marker classifies only this continuation response. It never
+    // gates later checkpoint calls.
+    if (checkpointRequested) clearCollection();
 
     if (!isDecision(event.message, checkpointRequested)) {
       updateHud(ctx);
@@ -200,7 +209,7 @@ export default function (pi: ExtensionAPI) {
       return entries.length > event.entries.length ? { entries } : undefined;
     }
     entries.push({ type: "custom", customType: CHECK_TYPE, data: { stage: state.stage, unit: "decision" } });
-    awaitingCheckpoint = true;
+    collectingRequestedCheckpoint = true;
     collectionTarget = target;
     injectCheckpointRequest = true;
     updateHud(ctx);
@@ -208,8 +217,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_before_settle", (_event, ctx) => {
-    // Missing/malformed tool calls or an aborted continuation must not leave a request armed.
-    clearRequest();
+    // An aborted continuation must not leave a re-orientation collection turn armed.
+    clearCollection();
     updateHud(ctx);
   });
 }

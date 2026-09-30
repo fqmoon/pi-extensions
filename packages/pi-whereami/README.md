@@ -19,7 +19,7 @@ State: invalidation remains the likely issue
 Next: inspect the dirty propagation boundary
 ```
 
-Checkpoints are kept in conversation history.
+Checkpoints are kept in conversation history. The checkpoint tool itself is not gated by the periodic trigger: any valid checkpoint call is recorded immediately and shown in the HUD. Recording one does not reset or advance the re-orientation schedule.
 
 The extension also provides a HUD so the user can see the agent's latest recorded position and current status:
 
@@ -53,7 +53,7 @@ After installation, use Pi normally. No extra command is required.
 
 ## Custom re-orientation
 
-Before each checkpoint, `pi-whereami` gives the current agent a re-orientation prompt that tells it what to reconsider about the path it is taking.
+When a periodic check fires, `pi-whereami` gives the current agent a re-orientation prompt that tells it what to reconsider about the path it is taking, then asks it to leave a checkpoint.
 
 The default prompt focuses on questions such as:
 

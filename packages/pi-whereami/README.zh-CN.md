@@ -19,7 +19,7 @@ State: invalidation remains the likely issue
 Next: inspect the dirty propagation boundary
 ```
 
-Checkpoint 会保存在会话历史中。
+Checkpoint 会保存在会话历史中。Checkpoint 工具本身不受周期触发窗口限制：只要调用参数合法，就会立即记录并更新 HUD；主动记录 checkpoint 也不会重置或推进 re-orientation 的计数。
 
 除此之外，插件还提供一个 HUD 面板，让用户也能看到 Agent 当前记录的位置和运行状态：
 
@@ -53,7 +53,7 @@ pi install npm:pi-whereami
 
 ## Custom re-orientation
 
-每次触发 checkpoint 之前，`pi-whereami` 都会先给当前 Agent 一段 re-orientation 提示，让它重新审视自己正在走的路径。
+每次周期检查触发时，`pi-whereami` 会先给当前 Agent 一段 re-orientation 提示，让它重新审视自己正在走的路径，然后要求它留下一条 checkpoint。
 
 默认提示主要检查这些问题：
 

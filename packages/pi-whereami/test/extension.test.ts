@@ -117,6 +117,45 @@ async function collectCheckpoint(h: ReturnType<typeof harness>, scope = "rendere
   return h.boundary([{ toolName: TOOL_NAME, toolCallId: "hud-sample", isError: false, details: recorded.details }]);
 }
 
+test("checkpoint records outside a re-orientation window without advancing decision progress", async () => {
+  const h = harness();
+  await h.emit("session_start");
+  await h.emit("agent_start");
+  await h.emit("message_start", { message: { role: "user" } });
+  await h.decisions(5);
+  const recorded = await h.tool.execute("spontaneous", {
+    level: "module", scope: "renderer", state: "checking current position", next: "continue analysis",
+  });
+  assert.equal(recorded.content[0].text, "Checkpoint recorded; continue the task.");
+  const after = await h.boundary([{ toolName: TOOL_NAME, toolCallId: "spontaneous", isError: false, details: recorded.details }]);
+  assert.deepEqual(after.entries.map((entry: any) => entry.type), ["context_edit", "context_edit", "custom_message"]);
+  assert.deepEqual(restoreState(h.ctx.sessionManager.getBranch()), { stage: 0, decisionsSinceCheck: 5 });
+  assert.deepEqual(restoreHudProgress(h.ctx.sessionManager.getBranch()), { decisions: 5, checkpoints: 1 });
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 5\/12 · Checkpoints: 1 · Latest checkpoint/);
+  assert.equal(await h.decisions(6), undefined);
+  assert.equal((await h.decisions(1))?.continue, true);
+});
+
+test("a checkpoint remains valid after the requested collection turn was missed", async () => {
+  const h = harness();
+  await h.emit("session_start");
+  await h.emit("agent_start");
+  await h.decisions(12);
+  await h.emit("context", { messages: [] });
+  const missed = await h.boundary(h.actions(1));
+  assert.equal(missed.continue, undefined);
+  assert.deepEqual(restoreState(h.ctx.sessionManager.getBranch()), { stage: 1, decisionsSinceCheck: 1 });
+
+  const recorded = await h.tool.execute("late", {
+    level: "module", scope: "renderer", state: "late checkpoint is still valid", next: "continue task",
+  });
+  assert.equal(recorded.content[0].text, "Checkpoint recorded; continue the task.");
+  await h.boundary([{ toolName: TOOL_NAME, toolCallId: "late", isError: false, details: recorded.details }]);
+  assert.deepEqual(restoreState(h.ctx.sessionManager.getBranch()), { stage: 1, decisionsSinceCheck: 1 });
+  assert.deepEqual(restoreHudProgress(h.ctx.sessionManager.getBranch()), { decisions: 13, checkpoints: 1 });
+  assert.match(h.widgets.get("pi-whereami")!.content[0], /Decisions: 13\/20 · Checkpoints: 1 · Latest checkpoint/);
+});
+
 test("HUD stays visible between runs and keeps cumulative progress through successful checkpoints", async () => {
   const h = harness();
   assert.equal(CHECKPOINT_TYPE, "pi-whereami-checkpoint");

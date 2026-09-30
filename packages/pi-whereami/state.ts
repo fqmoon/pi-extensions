@@ -19,9 +19,12 @@ export function hasTaskToolCall(message: SessionMessage): boolean {
 /** One completed main-task response is one decision, regardless of batch size. */
 export function isDecision(message: SessionMessage, checkpointRequested = false): boolean {
   if (message.role !== "assistant" || message.stopReason === "error" || message.stopReason === "aborted") return false;
-  // A requested response with no task tools is collection only, even when the
-  // checkpoint is missing/malformed or the model includes text/thinking.
-  return !checkpointRequested || hasTaskToolCall(message);
+  if (hasTaskToolCall(message)) return true;
+  // A requested collection response is not a task decision, even when the
+  // checkpoint is missing/malformed. A spontaneous checkpoint-only response is
+  // also observation rather than task progress and must not move the trigger.
+  if (checkpointRequested) return false;
+  return !message.content.some((part) => part.type === "toolCall" && part.name === TOOL_NAME);
 }
 
 export interface TriggerState {

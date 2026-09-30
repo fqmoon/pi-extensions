@@ -74,6 +74,7 @@ test("decision classification counts responses rather than tools or results", ()
     const message = assistant("sample", tools).message;
     assert.equal(isDecision(message as any, true), false);
   }
+  assert.equal(isDecision(assistant("spontaneous-checkpoint", [TOOL_NAME]).message as any), false);
   assert.equal(isDecision(assistant("mixed", [TOOL_NAME, "read"]).message as any, true), true);
   assert.equal(isDecision(assistant("missing", ["read"]).message as any, true), true);
   for (const stopReason of ["error", "aborted"]) {
