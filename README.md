@@ -23,9 +23,9 @@ Each extension is kept as an independent package so it can be published to npm s
 
 ### whereami
 
-Automatically records brief position checkpoints during long autonomous runs (12, then 8, 6, 4… main-task LLM decision turns after each user message) with the `whereami_checkpoint` tool. A HUD above the editor shows cumulative decision thresholds (0/12, then 13/20…), the successful checkpoint count, and the latest position without replacing conversation-history records. It stays visible after each agent run ends.
+Periodically prompts the agent to re-orient during long tasks and record a brief checkpoint with the `whereami_checkpoint` tool. It counts main-task LLM decision turns after each user message; the default intervals are 20, then 15, then 10 turns (repeating). A HUD above the editor shows decision progress, the next trigger threshold, and the latest checkpoint. Checkpoints are saved in conversation history, and the HUD stays visible after each agent run ends.
 
-Location: [`packages/pi-whereami`](./packages/pi-whereami). Requires PI 0.87.1 or newer; no settings or commands.
+Location: [`packages/pi-whereami`](./packages/pi-whereami). Requires Pi 0.87.1 or newer. No command is needed; optional interval and re-orientation prompt configuration is available.
 
 ## Archived
 
